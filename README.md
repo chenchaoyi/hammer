@@ -33,6 +33,12 @@ To enable debug:
 GOPATH=`pwd`:$GOPATH go run hammer.go -rps 1 -debug   
 ```
 
+To build Hammer for Mac OSX:
+==========================
+```shell
+GOPATH=`pwd`:$GOPATH CGO_ENABLED=0 go build -o hammer.prod.mac hammer.go
+```
+
 To build Hammer for Linux:
 ==========================
 You need to properly compile/update Go for Linux first:
