@@ -4,7 +4,6 @@ HTTP Stress test tool in Go
 
 Files:
 ======
-
 hammer.go - the client hammer tool   
 server.go - a lightweight server just for testing purpose   
 
@@ -14,8 +13,10 @@ To run the test with profile file:
 GOPATH=`pwd`:$GOPATH go run hammer.go -profile ${path_to_profile_file} -rps 1   
 ```
 
-To run the test with more logic defined in trafficprofile.go:
+To run the test with more logic:
 ============================
+Logic is defined in src/trafficprofiles/trafficprofile.go
+
 ```shell
 GOPATH=`pwd`:$GOPATH go run hammer.go -rps 1   
 ```
