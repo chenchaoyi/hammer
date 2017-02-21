@@ -1,0 +1,12 @@
+{
+  "Weight": 40,
+  "URL":"https://httpbin.org/get",
+  "Method":"GET",
+  "Body":""
+}
+{
+  "Weight": 20,
+  "URL":"https://httpbin.org/post",
+  "Method":"POST",
+  "Body":"{\"test\":\"hammer\"}"
+}
