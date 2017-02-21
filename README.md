@@ -20,7 +20,7 @@ Lightweight HTTP(s) Stress test tool in Go
   -proxy string
         Set HTTP proxy (need to specify scheme. e.g. http://127.0.0.1:8888) (default "none")
   -rps int
-        set RPS (default 100)
+        set Requst Per Second (default 100)
 ```
 
 #### To run the test with profile file:
