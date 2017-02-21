@@ -3,7 +3,6 @@
 Lightweight HTTP(s) Stress test tool in Go
 
 ## Usage:
-======
 
 ```shell
   -auth string
@@ -77,7 +76,7 @@ GOOS=linux GOARCH=amd64 GOPATH=`pwd` CGO_ENABLED=0 go build -o hammer.prod.linux
 ```
 
 ## Files:
-======
-hammer.go - the client hammer tool
-server.go - a lightweight server just for testing purpose for now
+
+* hammer.go - the client hammer tool
+* server.go - a lightweight server just for testing purpose for now
 
