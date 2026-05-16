@@ -1,0 +1,82 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build and release binaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          check-latest: true
+
+      - name: Run tests
+        run: go test -race ./...
+
+      - name: Build cross-platform binaries
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF#refs/tags/}"
+          mkdir -p dist
+
+          targets=(
+            linux/amd64
+            linux/arm64
+            darwin/amd64
+            darwin/arm64
+            windows/amd64
+          )
+          for target in "${targets[@]}"; do
+            GOOS="${target%/*}"
+            GOARCH="${target#*/}"
+            ext=""
+            [ "$GOOS" = "windows" ] && ext=".exe"
+            bin="hammer-${GOOS}-${GOARCH}${ext}"
+            echo "Building $bin"
+            GOOS="$GOOS" GOARCH="$GOARCH" CGO_ENABLED=0 go build \
+              -trimpath \
+              -ldflags="-s -w -X main.version=${VERSION}" \
+              -o "dist/${bin}" .
+          done
+
+      - name: Package archives and checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          for bin in hammer-*; do
+            case "$bin" in
+              *.exe)
+                base="${bin%.exe}"
+                zip "${base}.zip" "$bin"
+                ;;
+              *.zip|*.tar.gz|SHA256SUMS)
+                continue
+                ;;
+              *)
+                tar -czf "${bin}.tar.gz" "$bin"
+                ;;
+            esac
+          done
+          rm -f hammer-*-amd64 hammer-*-arm64 hammer-*.exe
+          sha256sum *.tar.gz *.zip > SHA256SUMS
+          ls -lh
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/SHA256SUMS
+          generate_release_notes: true
+          fail_on_unmatched_files: true

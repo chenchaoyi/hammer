@@ -520,6 +520,9 @@ func parseExtraOKCodes(s string) (map[int]bool, error) {
 	return out, nil
 }
 
+// version is overridden via -ldflags="-X main.version=..." in release builds.
+var version = "dev"
+
 func main() {
 	var (
 		rps           int
@@ -533,6 +536,7 @@ func main() {
 		statsAddr     string
 		extraOKList   string
 		jsonOut       string
+		showVersion   bool
 	)
 
 	flag.IntVar(&rps, "rps", 100, "requests per second")
@@ -546,7 +550,13 @@ func main() {
 	flag.StringVar(&statsAddr, "stats-addr", ":9001", "address to serve /stats endpoint on (empty to disable)")
 	flag.StringVar(&extraOKList, "ok", "", "extra status codes treated as success (comma-separated, e.g. \"404,409\")")
 	flag.StringVar(&jsonOut, "json-out", "", "path to write a structured JSON report on exit (empty to skip)")
+	flag.BoolVar(&showVersion, "version", false, "print version and exit")
 	flag.Parse()
+
+	if showVersion {
+		fmt.Printf("hammer %s\n", version)
+		return
+	}
 
 	if profileFile == "" {
 		fmt.Fprintln(os.Stderr, "Error: -profile is required")
