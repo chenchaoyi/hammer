@@ -1,5 +1,9 @@
 # Hammer
 
+[![ci](https://github.com/chenchaoyi/hammer/actions/workflows/ci.yml/badge.svg)](https://github.com/chenchaoyi/hammer/actions/workflows/ci.yml)
+[![release](https://img.shields.io/github/v/release/chenchaoyi/hammer?logo=github&label=release)](https://github.com/chenchaoyi/hammer/releases/latest)
+[![license](https://img.shields.io/github/license/chenchaoyi/hammer)](LICENSE)
+
 Lightweight, single-binary HTTP(S) load generator written in Go.
 
 - **Constant-rate**: drives a configurable RPS using a tick loop
@@ -15,6 +19,35 @@ Lightweight, single-binary HTTP(S) load generator written in Go.
 
 ## Install
 
+### Prebuilt binary (recommended)
+
+Grab the archive for your platform from the [latest GitHub release](https://github.com/chenchaoyi/hammer/releases/latest):
+
+```shell
+# macOS (Apple Silicon)
+curl -L https://github.com/chenchaoyi/hammer/releases/latest/download/hammer-darwin-arm64.tar.gz | tar xz
+./hammer-darwin-arm64 -version
+
+# Linux x86_64
+curl -L https://github.com/chenchaoyi/hammer/releases/latest/download/hammer-linux-amd64.tar.gz | tar xz
+./hammer-linux-amd64 -version
+```
+
+Binaries are statically linked (no libc dependency), ~7-8 MB, available for:
+
+- `linux/amd64`, `linux/arm64`
+- `darwin/amd64`, `darwin/arm64`
+- `windows/amd64`
+
+Each release also includes a `SHA256SUMS` file:
+
+```shell
+curl -LO https://github.com/chenchaoyi/hammer/releases/latest/download/SHA256SUMS
+sha256sum -c SHA256SUMS --ignore-missing
+```
+
+### From source
+
 Requires Go 1.24+.
 
 ```shell
@@ -23,7 +56,7 @@ cd hammer
 go build -o hammer .
 ```
 
-Cross-compile for Linux:
+Cross-compile, e.g. for Linux:
 
 ```shell
 GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o hammer.linux .
@@ -96,6 +129,7 @@ Network errors:
 | `-stats-addr`  | `:9001` | Address for the `/stats` HTTP endpoint; empty string disables it         |
 | `-ok`          | `""`    | Extra status codes treated as success (e.g. `-ok "404,409"`). 2xx and 3xx are always OK. |
 | `-json-out`    | `""`    | Path to write a structured JSON report on exit; empty to skip               |
+| `-version`     | `false` | Print version (set via `-ldflags="-X main.version=..."`) and exit           |
 
 Run `./hammer -h` for the live list.
 
@@ -250,6 +284,17 @@ go test -race ./...     # race detector
 go test -cover ./...    # coverage report
 go vet ./...
 ```
+
+## Cutting a release
+
+The `.github/workflows/release.yml` workflow builds cross-platform binaries and uploads them to a GitHub release whenever a `v*` tag is pushed:
+
+```shell
+git tag -a v1.0.0 -m "v1.0.0"
+git push origin v1.0.0
+```
+
+The workflow runs the test suite first, then builds for `linux/{amd64,arm64}`, `darwin/{amd64,arm64}`, and `windows/amd64`, packages each into a `.tar.gz` (or `.zip` for Windows), generates a `SHA256SUMS` file, and attaches everything to the release with auto-generated notes.
 
 ## Layout
 
