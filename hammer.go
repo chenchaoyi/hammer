@@ -8,11 +8,13 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -22,17 +24,76 @@ import (
 	"github.com/chenchaoyi/hammer/profile"
 )
 
+// netErrCategory names every kind of transport-layer failure we recognize.
+type netErrCategory int
+
+const (
+	netErrNone netErrCategory = iota
+	netErrCanceled
+	netErrTimeout
+	netErrDNS
+	netErrConn
+	netErrTLS
+	netErrOther
+)
+
+var netErrCategoryNames = [...]string{
+	netErrNone:     "none",
+	netErrCanceled: "canceled",
+	netErrTimeout:  "timeout",
+	netErrDNS:      "dns",
+	netErrConn:     "conn",
+	netErrTLS:      "tls",
+	netErrOther:    "other",
+}
+
+func classifyErr(err error) netErrCategory {
+	if err == nil {
+		return netErrNone
+	}
+	if errors.Is(err, context.Canceled) {
+		return netErrCanceled
+	}
+	var ue *url.Error
+	if errors.As(err, &ue) && ue.Timeout() {
+		return netErrTimeout
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return netErrTimeout
+	}
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		return netErrDNS
+	}
+	msg := err.Error()
+	if strings.Contains(msg, "x509") || strings.Contains(msg, "tls:") {
+		return netErrTLS
+	}
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
+		return netErrConn
+	}
+	return netErrOther
+}
+
 type Counter struct {
-	sentCount   atomic.Int64
-	recvCount   atomic.Int64
-	errCount    atomic.Int64
-	slowCount   atomic.Int64
-	totalTimeNs atomic.Int64
+	sentCount     atomic.Int64
+	recvCount     atomic.Int64 // 2xx/3xx or extra-OK responses
+	errCount      atomic.Int64 // network errors + non-OK status codes
+	canceledCount atomic.Int64 // requests canceled (usually shutdown); not in errCount
+	slowCount     atomic.Int64
+	totalTimeNs   atomic.Int64
 
 	lastSent int64
 	lastRecv int64
 
 	slowThreshold time.Duration
+	extraOKCodes  map[int]bool
+
+	// Per–HTTP-status-code histogram (indices 100-599).
+	statusCounts [600]atomic.Int64
+	// Per-category network-error histogram.
+	netErrCounts [len(netErrCategoryNames)]atomic.Int64
 
 	latMu sync.Mutex
 	latMs []float64 // milliseconds, successful responses only
@@ -42,7 +103,7 @@ type Counter struct {
 	debug   bool
 }
 
-func newCounter(p *profile.Profile, timeout, slow time.Duration, proxyURL string, insecureTLS, debug bool) (*Counter, error) {
+func newCounter(p *profile.Profile, timeout, slow time.Duration, proxyURL string, insecureTLS, debug bool, extraOK map[int]bool) (*Counter, error) {
 	tr := &http.Transport{
 		DisableKeepAlives:   false,
 		MaxIdleConns:        4096,
@@ -61,15 +122,24 @@ func newCounter(p *profile.Profile, timeout, slow time.Duration, proxyURL string
 		client:        &http.Client{Transport: tr, Timeout: timeout},
 		profile:       p,
 		slowThreshold: slow,
+		extraOKCodes:  extraOK,
 		latMs:         make([]float64, 0, 4096),
 		debug:         debug,
 	}, nil
 }
 
+func (c *Counter) isOK(statusCode int) bool {
+	if statusCode >= 200 && statusCode < 400 {
+		return true
+	}
+	return c.extraOKCodes[statusCode]
+}
+
 func (c *Counter) hammer(ctx context.Context) {
 	c.sentCount.Add(1)
 
-	method, u, body, ctype, call := c.profile.NextCall()
+	call := c.profile.NextCall()
+	method, u, body, ctype := call.Method, call.URL, call.Body, call.Type
 
 	var reqBody io.Reader
 	if body != "" {
@@ -78,6 +148,7 @@ func (c *Counter) hammer(ctx context.Context) {
 	req, err := http.NewRequestWithContext(ctx, method, u, reqBody)
 	if err != nil {
 		c.errCount.Add(1)
+		c.netErrCounts[netErrOther].Add(1)
 		if c.debug {
 			log.Printf("build request: %v", err)
 		}
@@ -96,15 +167,26 @@ func (c *Counter) hammer(ctx context.Context) {
 			req.Header.Set("Content-Type", ctype)
 		}
 	}
+	// Per-call headers override the auto-inferred Content-Type.
+	for k, v := range call.Headers {
+		req.Header.Set(k, v)
+	}
 
 	t0 := time.Now()
 	res, err := c.client.Do(req)
 	elapsed := time.Since(t0)
 
 	if err != nil {
-		c.errCount.Add(1)
+		cat := classifyErr(err)
+		c.netErrCounts[cat].Add(1)
+		if cat == netErrCanceled {
+			c.canceledCount.Add(1)
+		} else {
+			c.errCount.Add(1)
+		}
 		if c.debug {
-			log.Printf("response time %s err on %s %s: %v", elapsed, method, u, err)
+			log.Printf("response time %s %s err on %s %s: %v",
+				elapsed, netErrCategoryNames[cat], method, u, err)
 		}
 		return
 	}
@@ -119,8 +201,11 @@ func (c *Counter) hammer(ctx context.Context) {
 	}
 	res.Body.Close()
 
-	// 409 Conflict is tolerated to preserve original behavior for idempotent PATCH/PUT flows.
-	if res.StatusCode >= 400 && res.StatusCode != 409 {
+	if sc := res.StatusCode; sc >= 100 && sc < len(c.statusCounts) {
+		c.statusCounts[sc].Add(1)
+	}
+
+	if !c.isOK(res.StatusCode) {
 		if c.debug {
 			log.Printf("status %s for %s %s", res.Status, method, u)
 		}
@@ -152,7 +237,7 @@ func (c *Counter) tick() {
 
 	sps := sent - c.lastSent
 	pps := recv - c.lastRecv
-	backlog := sent - recv - errs
+	backlog := sent - recv - errs - c.canceledCount.Load()
 	c.lastSent = sent
 	c.lastRecv = recv
 
@@ -187,6 +272,36 @@ func percentile(sorted []float64, q float64) float64 {
 	return sorted[idx]
 }
 
+func (c *Counter) statusBreakdown() string {
+	var b strings.Builder
+	any := false
+	for sc := 100; sc < len(c.statusCounts); sc++ {
+		if n := c.statusCounts[sc].Load(); n > 0 {
+			fmt.Fprintf(&b, "  %d: %d\n", sc, n)
+			any = true
+		}
+	}
+	if !any {
+		b.WriteString("  (none)\n")
+	}
+	return b.String()
+}
+
+func (c *Counter) netErrBreakdown() string {
+	var b strings.Builder
+	any := false
+	for cat := netErrCanceled; cat < netErrCategory(len(c.netErrCounts)); cat++ {
+		if n := c.netErrCounts[cat].Load(); n > 0 {
+			fmt.Fprintf(&b, "  %s: %d\n", netErrCategoryNames[cat], n)
+			any = true
+		}
+	}
+	if !any {
+		return ""
+	}
+	return b.String()
+}
+
 func (c *Counter) report() {
 	c.latMu.Lock()
 	samples := append([]float64(nil), c.latMs...)
@@ -198,12 +313,27 @@ func (c *Counter) report() {
 	fmt.Printf("Sent:     %d\n", c.sentCount.Load())
 	fmt.Printf("Received: %d\n", c.recvCount.Load())
 	fmt.Printf("Errors:   %d\n", c.errCount.Load())
+	if canceled := c.canceledCount.Load(); canceled > 0 {
+		fmt.Printf("Canceled: %d  (in-flight at shutdown)\n", canceled)
+	}
 	fmt.Printf("Slow:     %d  (> %s)\n", c.slowCount.Load(), c.slowThreshold)
 
+	fmt.Println()
+	fmt.Println("Status codes:")
+	fmt.Print(c.statusBreakdown())
+
+	if netErrs := c.netErrBreakdown(); netErrs != "" {
+		fmt.Println()
+		fmt.Println("Network errors:")
+		fmt.Print(netErrs)
+	}
+
 	if len(samples) == 0 {
+		fmt.Println()
 		fmt.Println("No successful samples; latency stats unavailable.")
 		return
 	}
+	fmt.Println()
 	fmt.Printf("Latency (ms):  min=%.2f  p50=%.2f  p90=%.2f  p95=%.2f  p99=%.2f  max=%.2f\n",
 		samples[0],
 		percentile(samples, 0.50),
@@ -217,6 +347,31 @@ func (c *Counter) report() {
 	fmt.Print(c.profile.Print())
 }
 
+// parseExtraOKCodes parses a comma-separated list of status codes
+// (e.g. "404,409") into a set, validating each code is in [100, 599].
+func parseExtraOKCodes(s string) (map[int]bool, error) {
+	out := map[int]bool{}
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return out, nil
+	}
+	for _, tok := range strings.Split(s, ",") {
+		tok = strings.TrimSpace(tok)
+		if tok == "" {
+			continue
+		}
+		n, err := strconv.Atoi(tok)
+		if err != nil {
+			return nil, fmt.Errorf("invalid status code %q", tok)
+		}
+		if n < 100 || n >= 600 {
+			return nil, fmt.Errorf("status code %d out of range [100, 599]", n)
+		}
+		out[n] = true
+	}
+	return out, nil
+}
+
 func main() {
 	var (
 		rps           int
@@ -228,6 +383,7 @@ func main() {
 		insecureTLS   bool
 		debug         bool
 		statsAddr     string
+		extraOKList   string
 	)
 
 	flag.IntVar(&rps, "rps", 100, "requests per second")
@@ -239,6 +395,7 @@ func main() {
 	flag.BoolVar(&insecureTLS, "insecure", false, "skip TLS certificate verification")
 	flag.BoolVar(&debug, "debug", false, "verbose request/response logging")
 	flag.StringVar(&statsAddr, "stats-addr", ":9001", "address to serve /stats endpoint on (empty to disable)")
+	flag.StringVar(&extraOKList, "ok", "", "extra status codes treated as success (comma-separated, e.g. \"404,409\")")
 	flag.Parse()
 
 	if profileFile == "" {
@@ -251,30 +408,46 @@ func main() {
 		os.Exit(2)
 	}
 
+	extraOK, err := parseExtraOKCodes(extraOKList)
+	if err != nil {
+		log.Fatalf("parse -ok: %v", err)
+	}
+
 	prof, err := profile.LoadFromFile(profileFile)
 	if err != nil {
 		log.Fatalf("load profile: %v", err)
 	}
 
-	c, err := newCounter(prof, timeout, slowThreshold, proxy, insecureTLS, debug)
+	c, err := newCounter(prof, timeout, slowThreshold, proxy, insecureTLS, debug, extraOK)
 	if err != nil {
 		log.Fatalf("init: %v", err)
 	}
 
-	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer cancel()
+	parentCtx, signalCancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer signalCancel()
+
+	// Drive shutdown through a single cancel() so in-flight requests
+	// always end with context.Canceled — whether the run ends via a
+	// signal or via -duration. That keeps the "timeout" bucket meaning
+	// "per-request HTTP timeout exceeded" only.
+	ctx, runCancel := context.WithCancel(parentCtx)
+	defer runCancel()
 	if duration > 0 {
-		var cancelDur context.CancelFunc
-		ctx, cancelDur = context.WithTimeout(ctx, duration)
-		defer cancelDur()
+		t := time.AfterFunc(duration, runCancel)
+		defer t.Stop()
 	}
 
 	if statsAddr != "" {
 		mux := http.NewServeMux()
 		mux.HandleFunc("/stats", func(w http.ResponseWriter, _ *http.Request) {
 			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-			fmt.Fprintf(w, "Sent: %d\nReceived: %d\nErrors: %d\n==========\n%s",
-				c.sentCount.Load(), c.recvCount.Load(), c.errCount.Load(), prof.Print())
+			fmt.Fprintf(w, "Sent: %d\nReceived: %d\nErrors: %d\nCanceled: %d\n",
+				c.sentCount.Load(), c.recvCount.Load(), c.errCount.Load(), c.canceledCount.Load())
+			fmt.Fprintf(w, "\nStatus codes:\n%s", c.statusBreakdown())
+			if netErrs := c.netErrBreakdown(); netErrs != "" {
+				fmt.Fprintf(w, "\nNetwork errors:\n%s", netErrs)
+			}
+			fmt.Fprintf(w, "\n==========\n%s", prof.Print())
 		})
 		srv := &http.Server{Addr: statsAddr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 		go func() {

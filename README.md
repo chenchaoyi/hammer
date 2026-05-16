@@ -4,8 +4,9 @@ Lightweight, single-binary HTTP(S) load generator written in Go.
 
 - **Constant-rate**: drives a configurable RPS using a tick loop
 - **Weighted traffic mix**: define multiple endpoints with relative weights in a JSON file
+- **Per-call headers**: set `Authorization`, API keys, tracing headers, … in the profile
 - **Live monitor**: per-second `SendPS / ReceivePS / AvgRT / Pending / Err% / Slow%` log line
-- **Final report**: min / p50 / p90 / p95 / p99 / max latency plus per-endpoint counters
+- **Final report**: latency percentiles + per–status-code histogram + network-error categories
 - **HTTP stats endpoint**: `GET /stats` while running
 - **Graceful shutdown**: SIGINT/SIGTERM or `-duration`
 - **Per-request timeout**: stops slow servers from piling up goroutines
@@ -48,6 +49,10 @@ Sent:     500
 Received: 498
 Errors:   0
 Slow:     0  (> 1s)
+
+Status codes:
+  200: 498
+
 Latency (ms):  min=140.12  p50=180.34  p90=220.55  p95=240.07  p99=310.82  max=410.43
 
 --- Per call ---
@@ -59,6 +64,19 @@ API: POST https://httpbin.org/post
 Total Call: 166
 Avg RT: 0.1815s
 +++++++
+```
+
+If the target returns mixed statuses or network errors, the summary breaks them down:
+
+```
+Status codes:
+  200: 412
+  404: 78
+  500: 8
+
+Network errors:
+  timeout: 2
+  conn: 1
 ```
 
 ## Flags
@@ -74,6 +92,7 @@ Avg RT: 0.1815s
 | `-insecure`    | `false` | Skip TLS certificate verification                                        |
 | `-debug`       | `false` | Verbose request/response logging (one log line per request)              |
 | `-stats-addr`  | `:9001` | Address for the `/stats` HTTP endpoint; empty string disables it         |
+| `-ok`          | `""`    | Extra status codes treated as success (e.g. `-ok "404,409"`). 2xx and 3xx are always OK. |
 
 Run `./hammer -h` for the live list.
 
@@ -86,7 +105,11 @@ A profile file is a **stream of JSON `Call` objects** (no enclosing array — ju
   "Weight": 40,
   "Method": "GET",
   "URL": "https://httpbin.org/get",
-  "Body": ""
+  "Body": "",
+  "Headers": {
+    "Authorization": "Bearer your-token",
+    "X-Trace-Id": "hammer-load-test"
+  }
 }
 {
   "Weight": 20,
@@ -97,13 +120,14 @@ A profile file is a **stream of JSON `Call` objects** (no enclosing array — ju
 }
 ```
 
-| Field    | Required | Description                                                                |
-|----------|----------|----------------------------------------------------------------------------|
-| `Weight` | yes      | Positive float; selection probability is `Weight / sum(Weight)`            |
-| `Method` | yes      | HTTP method (`GET`, `POST`, `PUT`, `PATCH`, `DELETE`, …)                   |
-| `URL`    | yes      | Full request URL including scheme                                          |
-| `Body`   | no       | Request body string (used for `POST`/`PUT`/`PATCH`)                        |
-| `Type`   | no       | Content-Type hint for write methods (see below)                            |
+| Field     | Required | Description                                                                |
+|-----------|----------|----------------------------------------------------------------------------|
+| `Weight`  | yes      | Positive float; selection probability is `Weight / sum(Weight)`            |
+| `Method`  | yes      | HTTP method (`GET`, `POST`, `PUT`, `PATCH`, `DELETE`, …)                   |
+| `URL`     | yes      | Full request URL including scheme                                          |
+| `Body`    | no       | Request body string (used for `POST`/`PUT`/`PATCH`)                        |
+| `Type`    | no       | Content-Type hint for write methods (see below)                            |
+| `Headers` | no       | Map of HTTP headers sent with this call; overrides the `Type`-inferred Content-Type if specified |
 
 `Type` values:
 
@@ -124,8 +148,15 @@ Disable the endpoint with `-stats-addr ""` if port 9001 conflicts with your test
 
 ## Behavior notes
 
-- **HTTP 4xx/5xx counts as an error**, except `409 Conflict` (kept to preserve original behavior for idempotent PATCH/PUT flows).
-- **`Pending` in the live log** = sent − received − errors. Steady non-zero values mean the target can't keep up with the requested RPS.
+- **Success vs. error**: 2xx and 3xx responses are successes. Anything else (including 4xx, 5xx, and network failures) is an error. Use `-ok "404,409"` to whitelist additional status codes as success.
+- **Network-error categories** reported in the summary:
+  - `timeout` – the per-request `-timeout` exceeded
+  - `canceled` – request was in-flight when the run ended (Ctrl+C or `-duration`); not counted in `Errors`
+  - `conn` – TCP dial / read / write failure (e.g. connection refused, reset)
+  - `dns` – name resolution failure
+  - `tls` – TLS handshake / certificate validation failure
+  - `other` – anything else (e.g. malformed URL)
+- **`Pending` in the live log** = sent − received − errors − canceled. Steady non-zero values mean the target can't keep up with the requested RPS.
 - **`-timeout`** caps each individual request. When the target slows down, prefer a low timeout to keep goroutine count bounded.
 - **`-rps`** is enforced by a fixed-interval ticker (`1s / rps`). Effective RPS is bounded by how fast the target can respond and how many file descriptors are available.
 

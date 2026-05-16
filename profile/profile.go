@@ -21,6 +21,9 @@ type Call struct {
 	// "WWW"  → application/x-www-form-urlencoded
 	// any other non-empty value is used as-is.
 	Type string `json:"Type,omitempty"`
+	// Headers are sent with every request for this call. If a header
+	// conflicts with the Content-Type implied by Type, Headers wins.
+	Headers map[string]string `json:"Headers,omitempty"`
 
 	randomWeight float32
 	count        atomic.Int64
@@ -82,15 +85,14 @@ func LoadFromFile(path string) (*Profile, error) {
 }
 
 // NextCall picks a call according to its weight.
-func (p *Profile) NextCall() (method, url, body, ctype string, call *Call) {
+func (p *Profile) NextCall() *Call {
 	r := rand.Float32() * p.totalWeight
 	for _, c := range p.calls {
 		if r <= c.randomWeight {
-			return c.Method, c.URL, c.Body, c.Type, c
+			return c
 		}
 	}
-	c := p.calls[len(p.calls)-1]
-	return c.Method, c.URL, c.Body, c.Type, c
+	return p.calls[len(p.calls)-1]
 }
 
 func (p *Profile) Print() string {

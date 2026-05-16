@@ -105,13 +105,36 @@ func TestNextCall_weightedDistribution(t *testing.T) {
 	const total = 100_000
 	counts := map[string]int{}
 	for i := 0; i < total; i++ {
-		_, u, _, _, _ := prof.NextCall()
-		counts[u]++
+		counts[prof.NextCall().URL]++
 	}
 	ratio := float64(counts["http://a/"]) / float64(total)
 	// Allow ±2pp drift on a 100k-sample run.
 	if ratio < 0.68 || ratio > 0.72 {
 		t.Errorf("a-url ratio=%.4f, want 0.70±0.02", ratio)
+	}
+}
+
+func TestLoadFromFile_parsesHeaders(t *testing.T) {
+	p := writeTempProfile(t, `{
+		"Weight": 1,
+		"Method": "GET",
+		"URL": "http://example.com/",
+		"Body": "",
+		"Headers": {
+			"Authorization": "Bearer abc123",
+			"X-Trace-Id": "load-test"
+		}
+	}`)
+	prof, err := LoadFromFile(p)
+	if err != nil {
+		t.Fatalf("LoadFromFile: %v", err)
+	}
+	got := prof.NextCall().Headers
+	if got["Authorization"] != "Bearer abc123" {
+		t.Errorf("Authorization=%q, want %q", got["Authorization"], "Bearer abc123")
+	}
+	if got["X-Trace-Id"] != "load-test" {
+		t.Errorf("X-Trace-Id=%q, want %q", got["X-Trace-Id"], "load-test")
 	}
 }
 
@@ -121,7 +144,7 @@ func TestNextCall_returnsCallPointerForRecording(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, _, _, _, call := prof.NextCall()
+	call := prof.NextCall()
 	call.Record(1_500_000_000) // 1.5s
 	call.Record(2_500_000_000) // 2.5s
 	if got := call.count.Load(); got != 2 {
