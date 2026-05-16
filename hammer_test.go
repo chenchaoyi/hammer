@@ -2,11 +2,13 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -367,6 +369,126 @@ func TestHammer_perCallHeadersAreSentAndOverrideContentType(t *testing.T) {
 	}
 	if got := h.Get("Content-Type"); got != "application/vnd.custom+json" {
 		t.Errorf("Content-Type=%q, want per-call header to override REST default", got)
+	}
+}
+
+func TestHammer_templatedURLIsRenderedPerRequest(t *testing.T) {
+	paths := make(chan string, 4)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case paths <- r.URL.RequestURI():
+		default:
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	path := filepath.Join(t.TempDir(), "profile.json")
+	contents := `{
+		"Weight": 1,
+		"Method": "GET",
+		"URL": "` + srv.URL + `/users/{{ randInt 1000000 }}",
+		"Body": ""
+	}`
+	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	prof, err := profile.LoadFromFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := newTestCounter(t, prof, time.Second, time.Second)
+
+	// Fire several requests and verify URLs differ (random IDs).
+	for i := 0; i < 4; i++ {
+		c.hammer(context.Background())
+	}
+	close(paths)
+	seen := map[string]bool{}
+	for p := range paths {
+		if !strings.HasPrefix(p, "/users/") {
+			t.Errorf("path doesn't have expected prefix: %q", p)
+		}
+		seen[p] = true
+	}
+	if len(seen) < 2 {
+		t.Errorf("expected multiple distinct paths from {{ randInt }}, got %d (%v)", len(seen), seen)
+	}
+}
+
+func TestBuildJSONReport_writesValidStructuredFile(t *testing.T) {
+	codes := []int{200, 200, 200, 500}
+	var idx atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		i := int(idx.Add(1)-1) % len(codes)
+		w.WriteHeader(codes[i])
+	}))
+	defer srv.Close()
+
+	prof := loadOneCallProfile(t, srv.URL, "GET", "", "")
+	c := newTestCounter(t, prof, time.Second, time.Second)
+	for i := 0; i < len(codes); i++ {
+		c.hammer(context.Background())
+	}
+
+	start := time.Now().Add(-1 * time.Second)
+	end := time.Now()
+	r := c.buildJSONReport(start, end, 100, "fake.json")
+
+	out := filepath.Join(t.TempDir(), "report.json")
+	if err := writeJSONReport(out, r); err != nil {
+		t.Fatalf("writeJSONReport: %v", err)
+	}
+
+	// Read back and verify structure round-trips.
+	data, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got JSONReport
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("unmarshal: %v\ndata=%s", err, data)
+	}
+
+	if got.Sent != 4 {
+		t.Errorf("Sent=%d, want 4", got.Sent)
+	}
+	if got.Received != 3 {
+		t.Errorf("Received=%d, want 3", got.Received)
+	}
+	if got.Errors != 1 {
+		t.Errorf("Errors=%d, want 1", got.Errors)
+	}
+	if got.TargetRPS != 100 || got.Profile != "fake.json" {
+		t.Errorf("TargetRPS=%d Profile=%q", got.TargetRPS, got.Profile)
+	}
+	if got.DurationSec <= 0 {
+		t.Errorf("DurationSec=%v, want > 0", got.DurationSec)
+	}
+
+	// Status codes should include 200:3 and 500:1.
+	found200, found500 := false, false
+	for _, s := range got.StatusCodes {
+		if s.Code == 200 && s.Count == 3 {
+			found200 = true
+		}
+		if s.Code == 500 && s.Count == 1 {
+			found500 = true
+		}
+	}
+	if !found200 || !found500 {
+		t.Errorf("status buckets missing: %+v", got.StatusCodes)
+	}
+
+	if got.LatencyMs.Samples != 3 {
+		t.Errorf("LatencyMs.Samples=%d, want 3", got.LatencyMs.Samples)
+	}
+	if got.LatencyMs.Mean <= 0 {
+		t.Errorf("LatencyMs.Mean=%v, want > 0", got.LatencyMs.Mean)
+	}
+
+	if len(got.PerCall) != 1 || got.PerCall[0].Count != 3 {
+		t.Errorf("PerCall=%+v", got.PerCall)
 	}
 }
 

@@ -138,6 +138,85 @@ func TestLoadFromFile_parsesHeaders(t *testing.T) {
 	}
 }
 
+func TestCall_RenderNoTemplate(t *testing.T) {
+	p := writeTempProfile(t, `{"Weight":1,"Method":"GET","URL":"http://x/static","Body":"plain"}`)
+	prof, err := LoadFromFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := prof.NextCall()
+	if c.urlTmpl != nil || c.bodyTmpl != nil {
+		t.Fatal("templates should not be compiled when no {{ }} present")
+	}
+	u, b, err := c.Render()
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	if u != "http://x/static" || b != "plain" {
+		t.Errorf("Render returned %q, %q", u, b)
+	}
+}
+
+func TestCall_RenderExpandsTemplates(t *testing.T) {
+	p := writeTempProfile(t, `{
+		"Weight": 1,
+		"Method": "GET",
+		"URL": "http://x/users/{{ randInt 1000 }}?trace={{ uuid }}",
+		"Body": "{\"name\":\"{{ randString 8 }}\",\"region\":\"{{ pickOne \"us\" \"eu\" \"ap\" }}\"}"
+	}`)
+	prof, err := LoadFromFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := prof.NextCall()
+	if c.urlTmpl == nil || c.bodyTmpl == nil {
+		t.Fatal("templates should be compiled")
+	}
+	u, b, err := c.Render()
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+
+	// URL: numeric id + uuid; "{{" must be gone.
+	if strings.Contains(u, "{{") {
+		t.Errorf("URL still has template markers: %q", u)
+	}
+	if !strings.HasPrefix(u, "http://x/users/") || !strings.Contains(u, "?trace=") {
+		t.Errorf("URL shape unexpected: %q", u)
+	}
+	// Body: random 8-char name + region from the allowlist.
+	if !strings.Contains(b, `"name":"`) || strings.Contains(b, "{{") {
+		t.Errorf("Body shape unexpected: %q", b)
+	}
+	region := ""
+	for _, r := range []string{"us", "eu", "ap"} {
+		if strings.Contains(b, `"region":"`+r+`"`) {
+			region = r
+			break
+		}
+	}
+	if region == "" {
+		t.Errorf("region not one of us/eu/ap: %q", b)
+	}
+
+	// Calling Render twice must yield different values for random pieces.
+	u2, _, _ := c.Render()
+	if u == u2 {
+		// Could happen with astronomically low probability; retry once.
+		u2, _, _ = c.Render()
+		if u == u2 {
+			t.Errorf("two consecutive renders produced identical URLs: %q", u)
+		}
+	}
+}
+
+func TestCall_RenderTemplateParseError(t *testing.T) {
+	p := writeTempProfile(t, `{"Weight":1,"Method":"GET","URL":"http://x/{{ unknownFunc }}","Body":""}`)
+	if _, err := LoadFromFile(p); err == nil {
+		t.Fatal("expected template parse error")
+	}
+}
+
 func TestNextCall_returnsCallPointerForRecording(t *testing.T) {
 	p := writeTempProfile(t, `{"Weight":1,"Method":"GET","URL":"http://x/","Body":""}`)
 	prof, err := LoadFromFile(p)

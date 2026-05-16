@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -139,7 +140,17 @@ func (c *Counter) hammer(ctx context.Context) {
 	c.sentCount.Add(1)
 
 	call := c.profile.NextCall()
-	method, u, body, ctype := call.Method, call.URL, call.Body, call.Type
+	method, ctype := call.Method, call.Type
+
+	u, body, err := call.Render()
+	if err != nil {
+		c.errCount.Add(1)
+		c.netErrCounts[netErrOther].Add(1)
+		if c.debug {
+			log.Printf("render template for %s %s: %v", method, call.URL, err)
+		}
+		return
+	}
 
 	var reqBody io.Reader
 	if body != "" {
@@ -333,9 +344,15 @@ func (c *Counter) report() {
 		fmt.Println("No successful samples; latency stats unavailable.")
 		return
 	}
+	var sum float64
+	for _, v := range samples {
+		sum += v
+	}
+	mean := sum / float64(len(samples))
 	fmt.Println()
-	fmt.Printf("Latency (ms):  min=%.2f  p50=%.2f  p90=%.2f  p95=%.2f  p99=%.2f  max=%.2f\n",
+	fmt.Printf("Latency (ms):  min=%.2f  mean=%.2f  p50=%.2f  p90=%.2f  p95=%.2f  p99=%.2f  max=%.2f\n",
 		samples[0],
+		mean,
 		percentile(samples, 0.50),
 		percentile(samples, 0.90),
 		percentile(samples, 0.95),
@@ -345,6 +362,137 @@ func (c *Counter) report() {
 	fmt.Println()
 	fmt.Println("--- Per call ---")
 	fmt.Print(c.profile.Print())
+}
+
+// --- JSON report --------------------------------------------------------
+
+type LatencyReport struct {
+	Samples int     `json:"samples"`
+	Min     float64 `json:"min"`
+	Mean    float64 `json:"mean"`
+	P50     float64 `json:"p50"`
+	P90     float64 `json:"p90"`
+	P95     float64 `json:"p95"`
+	P99     float64 `json:"p99"`
+	Max     float64 `json:"max"`
+}
+
+type StatusBucket struct {
+	Code  int   `json:"code"`
+	Count int64 `json:"count"`
+}
+
+type NetErrBucket struct {
+	Category string `json:"category"`
+	Count    int64  `json:"count"`
+}
+
+type CallReport struct {
+	Method   string  `json:"method"`
+	URL      string  `json:"url"`
+	Count    int64   `json:"count"`
+	AvgRTSec float64 `json:"avg_rt_sec"`
+}
+
+type JSONReport struct {
+	StartTime        time.Time      `json:"start_time"`
+	EndTime          time.Time      `json:"end_time"`
+	DurationSec      float64        `json:"duration_sec"`
+	TargetRPS        int            `json:"target_rps"`
+	Profile          string         `json:"profile"`
+	Sent             int64          `json:"sent"`
+	Received         int64          `json:"received"`
+	Errors           int64          `json:"errors"`
+	Canceled         int64          `json:"canceled"`
+	Slow             int64          `json:"slow"`
+	SlowThresholdSec float64        `json:"slow_threshold_sec"`
+	StatusCodes      []StatusBucket `json:"status_codes"`
+	NetworkErrors    []NetErrBucket `json:"network_errors"`
+	LatencyMs        LatencyReport  `json:"latency_ms"`
+	PerCall          []CallReport   `json:"per_call"`
+}
+
+func (c *Counter) buildJSONReport(start, end time.Time, rps int, profilePath string) *JSONReport {
+	c.latMu.Lock()
+	samples := append([]float64(nil), c.latMs...)
+	c.latMu.Unlock()
+	sort.Float64s(samples)
+
+	var lat LatencyReport
+	if n := len(samples); n > 0 {
+		var sum float64
+		for _, v := range samples {
+			sum += v
+		}
+		lat = LatencyReport{
+			Samples: n,
+			Min:     samples[0],
+			Mean:    sum / float64(n),
+			P50:     percentile(samples, 0.50),
+			P90:     percentile(samples, 0.90),
+			P95:     percentile(samples, 0.95),
+			P99:     percentile(samples, 0.99),
+			Max:     samples[n-1],
+		}
+	}
+
+	statuses := make([]StatusBucket, 0)
+	for sc := 100; sc < len(c.statusCounts); sc++ {
+		if n := c.statusCounts[sc].Load(); n > 0 {
+			statuses = append(statuses, StatusBucket{Code: sc, Count: n})
+		}
+	}
+
+	netErrs := make([]NetErrBucket, 0)
+	for cat := netErrCanceled; cat < netErrCategory(len(c.netErrCounts)); cat++ {
+		if n := c.netErrCounts[cat].Load(); n > 0 {
+			netErrs = append(netErrs, NetErrBucket{Category: netErrCategoryNames[cat], Count: n})
+		}
+	}
+
+	calls := make([]CallReport, 0, len(c.profile.Calls()))
+	for _, pc := range c.profile.Calls() {
+		n := pc.Count()
+		var avg float64
+		if n > 0 {
+			avg = float64(pc.TotalTimeNs()) / float64(n) / 1e9
+		}
+		calls = append(calls, CallReport{
+			Method:   pc.Method,
+			URL:      pc.URL,
+			Count:    n,
+			AvgRTSec: avg,
+		})
+	}
+
+	return &JSONReport{
+		StartTime:        start,
+		EndTime:          end,
+		DurationSec:      end.Sub(start).Seconds(),
+		TargetRPS:        rps,
+		Profile:          profilePath,
+		Sent:             c.sentCount.Load(),
+		Received:         c.recvCount.Load(),
+		Errors:           c.errCount.Load(),
+		Canceled:         c.canceledCount.Load(),
+		Slow:             c.slowCount.Load(),
+		SlowThresholdSec: c.slowThreshold.Seconds(),
+		StatusCodes:      statuses,
+		NetworkErrors:    netErrs,
+		LatencyMs:        lat,
+		PerCall:          calls,
+	}
+}
+
+func writeJSONReport(path string, r *JSONReport) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	enc := json.NewEncoder(f)
+	enc.SetIndent("", "  ")
+	return enc.Encode(r)
 }
 
 // parseExtraOKCodes parses a comma-separated list of status codes
@@ -384,6 +532,7 @@ func main() {
 		debug         bool
 		statsAddr     string
 		extraOKList   string
+		jsonOut       string
 	)
 
 	flag.IntVar(&rps, "rps", 100, "requests per second")
@@ -396,6 +545,7 @@ func main() {
 	flag.BoolVar(&debug, "debug", false, "verbose request/response logging")
 	flag.StringVar(&statsAddr, "stats-addr", ":9001", "address to serve /stats endpoint on (empty to disable)")
 	flag.StringVar(&extraOKList, "ok", "", "extra status codes treated as success (comma-separated, e.g. \"404,409\")")
+	flag.StringVar(&jsonOut, "json-out", "", "path to write a structured JSON report on exit (empty to skip)")
 	flag.Parse()
 
 	if profileFile == "" {
@@ -474,6 +624,7 @@ func main() {
 		durLabel = "for " + duration.String()
 	}
 	log.Printf("Hammering @ %d rps %s (timeout=%s, profile=%s)", rps, durLabel, timeout, profileFile)
+	startTime := time.Now()
 
 LOOP:
 	for {
@@ -486,7 +637,17 @@ LOOP:
 			go c.hammer(ctx)
 		}
 	}
+	endTime := time.Now()
 
 	log.Println("Stopping...")
 	c.report()
+
+	if jsonOut != "" {
+		r := c.buildJSONReport(startTime, endTime, rps, profileFile)
+		if err := writeJSONReport(jsonOut, r); err != nil {
+			log.Printf("write json report: %v", err)
+		} else {
+			log.Printf("JSON report written to %s", jsonOut)
+		}
+	}
 }

@@ -1,13 +1,17 @@
 package profile
 
 import (
+	"bytes"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
-	"math/rand"
+	"math/rand/v2"
 	"os"
 	"strings"
 	"sync/atomic"
+	"text/template"
+	"time"
 )
 
 // Call describes one weighted HTTP call in a traffic profile.
@@ -26,13 +30,44 @@ type Call struct {
 	Headers map[string]string `json:"Headers,omitempty"`
 
 	randomWeight float32
-	count        atomic.Int64
-	totalTimeNs  atomic.Int64
+	urlTmpl      *template.Template // nil when URL has no {{ }} placeholders
+	bodyTmpl     *template.Template
+
+	count       atomic.Int64
+	totalTimeNs atomic.Int64
 }
 
 func (c *Call) Record(d int64) {
 	c.count.Add(1)
 	c.totalTimeNs.Add(d)
+}
+
+// Count returns the number of successful requests recorded for this call.
+func (c *Call) Count() int64 { return c.count.Load() }
+
+// TotalTimeNs returns the cumulative response time of successful requests.
+func (c *Call) TotalTimeNs() int64 { return c.totalTimeNs.Load() }
+
+// Render returns the URL and body to use for one request, expanding any
+// {{ }} placeholders. When the call has no templates both fields are
+// returned verbatim and no allocations are performed.
+func (c *Call) Render() (url, body string, err error) {
+	url, body = c.URL, c.Body
+	if c.urlTmpl != nil {
+		var b bytes.Buffer
+		if err := c.urlTmpl.Execute(&b, nil); err != nil {
+			return "", "", fmt.Errorf("render URL template: %w", err)
+		}
+		url = b.String()
+	}
+	if c.bodyTmpl != nil {
+		var b bytes.Buffer
+		if err := c.bodyTmpl.Execute(&b, nil); err != nil {
+			return "", "", fmt.Errorf("render body template: %w", err)
+		}
+		body = b.String()
+	}
+	return url, body, nil
 }
 
 func (c *Call) String() string {
@@ -49,6 +84,11 @@ type Profile struct {
 	totalWeight float32
 	calls       []*Call
 }
+
+// Calls returns the profile's calls in their declared order. The returned
+// slice and its elements live for the lifetime of the Profile; callers
+// must not mutate them.
+func (p *Profile) Calls() []*Call { return p.calls }
 
 // LoadFromFile parses a traffic profile from a file containing a stream of
 // JSON-encoded Call objects (one after another, optionally separated by
@@ -73,6 +113,16 @@ func LoadFromFile(path string) (*Profile, error) {
 		c.Type = strings.ToUpper(c.Type)
 		if c.Weight <= 0 {
 			return nil, fmt.Errorf("call %s %s has non-positive weight", c.Method, c.URL)
+		}
+		if t, err := compileTemplate("url", c.URL); err != nil {
+			return nil, fmt.Errorf("URL template for %s %s: %w", c.Method, c.URL, err)
+		} else {
+			c.urlTmpl = t
+		}
+		if t, err := compileTemplate("body", c.Body); err != nil {
+			return nil, fmt.Errorf("body template for %s %s: %w", c.Method, c.URL, err)
+		} else {
+			c.bodyTmpl = t
 		}
 		p.totalWeight += c.Weight
 		c.randomWeight = p.totalWeight
@@ -102,4 +152,57 @@ func (p *Profile) Print() string {
 		b.WriteString("\n+++++++\n")
 	}
 	return b.String()
+}
+
+// --- Templating ---------------------------------------------------------
+
+// tmplFuncs are the helpers available inside URL / Body templates.
+// math/rand/v2 is used throughout: its top-level functions are
+// lock-free, so heavy templates do not serialize the load loop.
+var tmplFuncs = template.FuncMap{
+	"randInt":      func(n int) int { return rand.IntN(n) },
+	"randIntRange": func(lo, hi int) int { return lo + rand.IntN(hi-lo) },
+	"randString":   randString,
+	"uuid":         newUUIDv4,
+	"now":          func() int64 { return time.Now().Unix() },
+	"nowNano":      func() int64 { return time.Now().UnixNano() },
+	"pickOne":      pickOne,
+}
+
+func pickOne(args ...string) string {
+	if len(args) == 0 {
+		return ""
+	}
+	return args[rand.IntN(len(args))]
+}
+
+const alnum = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+
+func randString(n int) string {
+	if n <= 0 {
+		return ""
+	}
+	b := make([]byte, n)
+	for i := range b {
+		b[i] = alnum[rand.IntN(len(alnum))]
+	}
+	return string(b)
+}
+
+func newUUIDv4() string {
+	var b [16]byte
+	binary.LittleEndian.PutUint64(b[0:8], rand.Uint64())
+	binary.LittleEndian.PutUint64(b[8:16], rand.Uint64())
+	b[6] = (b[6] & 0x0f) | 0x40 // version 4
+	b[8] = (b[8] & 0x3f) | 0x80 // variant 10xx
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+}
+
+// compileTemplate returns nil (no error) when text contains no template
+// markers, so callers can skip Execute() and avoid allocations.
+func compileTemplate(name, text string) (*template.Template, error) {
+	if !strings.Contains(text, "{{") {
+		return nil, nil
+	}
+	return template.New(name).Funcs(tmplFuncs).Parse(text)
 }
