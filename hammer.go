@@ -1,415 +1,653 @@
 package main
 
 import (
-  "flag"
-  "fmt"
-  "io"
-  "io/ioutil"
-  "log"
-  "math/rand"
-  "net/http"
-  "net/url"
-  "oauth"
-  "runtime"
-  "strings"
-  // "sync"
-  "sync/atomic"
-  "time"
-  "trafficprofiles"
-  "crypto/tls"
+	"context"
+	"crypto/tls"
+	"encoding/json"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"log"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
+	"os/signal"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"syscall"
+	"time"
+
+	"github.com/chenchaoyi/hammer/profile"
 )
 
-// to reduce size of thread, speed up
-const SizePerThread = 10000000
+// netErrCategory names every kind of transport-layer failure we recognize.
+type netErrCategory int
 
-//var DefaultTransport RoundTripper = &Transport{Proxy: ProxyFromEnvironment}
+const (
+	netErrNone netErrCategory = iota
+	netErrCanceled
+	netErrTimeout
+	netErrDNS
+	netErrConn
+	netErrTLS
+	netErrOther
+)
 
-// Counter will be an atomic, to count the number of request handled
-// which will be used to print PPS, etc.
+var netErrCategoryNames = [...]string{
+	netErrNone:     "none",
+	netErrCanceled: "canceled",
+	netErrTimeout:  "timeout",
+	netErrDNS:      "dns",
+	netErrConn:     "conn",
+	netErrTLS:      "tls",
+	netErrOther:    "other",
+}
+
+func classifyErr(err error) netErrCategory {
+	if err == nil {
+		return netErrNone
+	}
+	if errors.Is(err, context.Canceled) {
+		return netErrCanceled
+	}
+	var ue *url.Error
+	if errors.As(err, &ue) && ue.Timeout() {
+		return netErrTimeout
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return netErrTimeout
+	}
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		return netErrDNS
+	}
+	msg := err.Error()
+	if strings.Contains(msg, "x509") || strings.Contains(msg, "tls:") {
+		return netErrTLS
+	}
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
+		return netErrConn
+	}
+	return netErrOther
+}
+
 type Counter struct {
-  lasttime      int64 // time of last print, in secon, to calculate RPS
-  lastcount     int64 // count of last print
-  lasttotaltime int64 // last total response time
+	sentCount     atomic.Int64
+	recvCount     atomic.Int64 // 2xx/3xx or extra-OK responses
+	errCount      atomic.Int64 // network errors + non-OK status codes
+	canceledCount atomic.Int64 // requests canceled (usually shutdown); not in errCount
+	slowCount     atomic.Int64
+	totalTimeNs   atomic.Int64
 
-  count     int64 // total # of request
-  totaltime int64 // total response time.
+	lastSent int64
+	lastRecv int64
 
-  totalerrors int64 // how many error
+	slowThreshold time.Duration
+	extraOKCodes  map[int]bool
 
-  totalslowresp int64 // how many slow response. 
+	// Per–HTTP-status-code histogram (indices 100-599).
+	statusCounts [600]atomic.Int64
+	// Per-category network-error histogram.
+	netErrCounts [len(netErrCategoryNames)]atomic.Int64
 
-  // to calculate send count
-  s_lasttime  int64
-  s_lastcount int64
-  s_count     int64
+	latMu sync.Mutex
+	latMs []float64 // milliseconds, successful responses only
 
-  // book keeping just for faster stats report so we do not do it again
-  avg_time      float64
-  last_avg_time float64
-  backlog       int64
-
-  client (*http.Client)
-
-  monitor (*time.Ticker)
-
-  // ideally error should be organized by type TODO
-  throttle <-chan time.Time
-
-  runinfo <-chan bool // to indicate current run is good or bad
-
-  // auto find pps
-  currentRPS  time.Duration
-  lastGoodRPS time.Duration
-  lastBadRPS  time.Duration
+	client  *http.Client
+	profile *profile.Profile
+	debug   bool
 }
 
-var TrafficProfile = new(trafficprofiles.Profile)
-var _DEBUG bool
-var _AUTH_METHOD string
-var _HOST string
-
-var oauth_client = new(oauth.Client)
-
-// init
-func (c *Counter) _init() {
-  // init http client
-  //c.client = &http.Client{}
-
-  if(proxy != "none") {
-    proxyUrl, err := url.Parse(proxy)
-    if err != nil {
-      log.Fatal(err)
-    }
-
-    c.client = &http.Client{
-      Transport: &http.Transport{
-        DisableKeepAlives:   false,
-        MaxIdleConnsPerHost: 200000,
-        Proxy: http.ProxyURL(proxyUrl),
-        TLSClientConfig: &tls.Config{InsecureSkipVerify : true},
-      },
-    }
-  } else {
-    c.client = &http.Client{
-      Transport: &http.Transport{
-        DisableKeepAlives:   false,
-        MaxIdleConnsPerHost: 200000,
-        TLSClientConfig: &tls.Config{InsecureSkipVerify : true},
-      },
-    }
-  }
-
-  // make channel for auto finder mode
-  c.runinfo = make(chan bool)
-
-  c.monitor = time.NewTicker(time.Second)
-  go func() {
-    for {
-      <-c.monitor.C // rate limit for monitor routine
-      go c.pperf()
-    }
-  }()
+func newCounter(p *profile.Profile, timeout, slow time.Duration, proxyURL string, insecureTLS, debug bool, extraOK map[int]bool) (*Counter, error) {
+	tr := &http.Transport{
+		DisableKeepAlives:   false,
+		MaxIdleConns:        4096,
+		MaxIdleConnsPerHost: 1024,
+		IdleConnTimeout:     90 * time.Second,
+		TLSClientConfig:     &tls.Config{InsecureSkipVerify: insecureTLS},
+	}
+	if proxyURL != "" {
+		u, err := url.Parse(proxyURL)
+		if err != nil {
+			return nil, fmt.Errorf("parse proxy: %w", err)
+		}
+		tr.Proxy = http.ProxyURL(u)
+	}
+	return &Counter{
+		client:        &http.Client{Transport: tr, Timeout: timeout},
+		profile:       p,
+		slowThreshold: slow,
+		extraOKCodes:  extraOK,
+		latMs:         make([]float64, 0, 4096),
+		debug:         debug,
+	}, nil
 }
 
-// increase the count and record response time.
-func (c *Counter) record(_time int64) {
-  atomic.AddInt64(&c.count, 1)
-  atomic.AddInt64(&c.totaltime, _time)
-
-  // if longer that 200ms, it is a slow response
-  //if _time > 200000000 {
-  if _time > 9000000000 {
-    atomic.AddInt64(&c.totalslowresp, 1)
-    log.Println("Slow response -> ", float64(_time)/1.0e9)
-  }
+func (c *Counter) isOK(statusCode int) bool {
+	if statusCode >= 200 && statusCode < 400 {
+		return true
+	}
+	return c.extraOKCodes[statusCode]
 }
 
-// when error happened, increase counter. maybe add error type later TODO
-func (c *Counter) recordError() {
-  atomic.AddInt64(&c.totalerrors, 1)
+func (c *Counter) hammer(ctx context.Context) {
+	c.sentCount.Add(1)
 
-  // we do not record time for errors.
-  // and there will not be count incr for calls as well
+	call := c.profile.NextCall()
+	method, ctype := call.Method, call.Type
+
+	u, body, err := call.Render()
+	if err != nil {
+		c.errCount.Add(1)
+		c.netErrCounts[netErrOther].Add(1)
+		if c.debug {
+			log.Printf("render template for %s %s: %v", method, call.URL, err)
+		}
+		return
+	}
+
+	var reqBody io.Reader
+	if body != "" {
+		reqBody = strings.NewReader(body)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, u, reqBody)
+	if err != nil {
+		c.errCount.Add(1)
+		c.netErrCounts[netErrOther].Add(1)
+		if c.debug {
+			log.Printf("build request: %v", err)
+		}
+		return
+	}
+
+	if method == "PATCH" || method == "PUT" || method == "POST" {
+		switch ctype {
+		case "REST":
+			req.Header.Set("Content-Type", "application/json; charset=utf-8")
+		case "WWW":
+			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		case "":
+			// no default
+		default:
+			req.Header.Set("Content-Type", ctype)
+		}
+	}
+	// Per-call headers override the auto-inferred Content-Type.
+	for k, v := range call.Headers {
+		req.Header.Set(k, v)
+	}
+
+	t0 := time.Now()
+	res, err := c.client.Do(req)
+	elapsed := time.Since(t0)
+
+	if err != nil {
+		cat := classifyErr(err)
+		c.netErrCounts[cat].Add(1)
+		if cat == netErrCanceled {
+			c.canceledCount.Add(1)
+		} else {
+			c.errCount.Add(1)
+		}
+		if c.debug {
+			log.Printf("response time %s %s err on %s %s: %v",
+				elapsed, netErrCategoryNames[cat], method, u, err)
+		}
+		return
+	}
+
+	// Drain & close body so keep-alive can reuse the connection.
+	if c.debug {
+		data, _ := io.ReadAll(res.Body)
+		log.Printf("Req: %s %s\nReq Body: %s\nRes: %s\nRes Body: %s",
+			method, u, body, res.Status, string(data))
+	} else {
+		_, _ = io.Copy(io.Discard, res.Body)
+	}
+	res.Body.Close()
+
+	if sc := res.StatusCode; sc >= 100 && sc < len(c.statusCounts) {
+		c.statusCounts[sc].Add(1)
+	}
+
+	if !c.isOK(res.StatusCode) {
+		if c.debug {
+			log.Printf("status %s for %s %s", res.Status, method, u)
+		}
+		c.errCount.Add(1)
+		return
+	}
+
+	c.recvCount.Add(1)
+	c.totalTimeNs.Add(elapsed.Nanoseconds())
+	if elapsed > c.slowThreshold {
+		c.slowCount.Add(1)
+		log.Printf("Slow response %s -> %s %s", elapsed, method, u)
+	}
+
+	call.Record(elapsed.Nanoseconds())
+
+	ms := float64(elapsed) / float64(time.Millisecond)
+	c.latMu.Lock()
+	c.latMs = append(c.latMs, ms)
+	c.latMu.Unlock()
 }
 
-func (c *Counter) recordSend() {
-  atomic.AddInt64(&c.s_count, 1)
+func (c *Counter) tick() {
+	sent := c.sentCount.Load()
+	recv := c.recvCount.Load()
+	errs := c.errCount.Load()
+	slow := c.slowCount.Load()
+	total := c.totalTimeNs.Load()
+
+	sps := sent - c.lastSent
+	pps := recv - c.lastRecv
+	backlog := sent - recv - errs - c.canceledCount.Load()
+	c.lastSent = sent
+	c.lastRecv = recv
+
+	avg := 0.0
+	if recv > 0 {
+		avg = float64(total) / float64(recv) / 1e9
+	}
+	denom := errs + recv
+	if denom == 0 {
+		denom = 1
+	}
+
+	log.Printf(" SendPS: %4d  ReceivePS: %4d  AvgRT: %.4fs  Pending: %d  Err: %d|%.2f%%  Slow: %.2f%%",
+		sps, pps, avg, backlog, errs,
+		float64(errs)*100/float64(denom),
+		float64(slow)*100/float64(denom))
 }
 
-// main goroutine to drive traffic
-func (c *Counter) hammer() {
-  var req *http.Request
-  var err error
-
-  _params := url.Values{}
-
-  t1 := time.Now().UnixNano()
-
-  // before send out, update send count
-  c.recordSend()
-
-  _method, _url, _body, _type, _call := TrafficProfile.NextCall()
-
-  req, err = http.NewRequest(_method, _url, strings.NewReader(_body))
-
-  // generate Oauth signatures with body_hash
-  switch _AUTH_METHOD {
-  case "oauth":
-    _signature := oauth_client.AuthorizationHeaderWithBodyHash(nil, _method, _url, _params, _body)
-    req.Header.Add("Authorization", _signature)
-  }
-
-  if _DEBUG {
-    log.Println(req.Header.Get("Authorization"))
-  }
-
-  if _method == "PATCH" || _method == "PUT" || _method == "POST" {
-    if _type == "REST" {
-      // for REST call, we use this one
-
-      // add special haeader for PATCH, PUT and POST
-      // _params.Set("Accept", "application/json")
-      req.Header.Set("Content-Type", "application/json; charset=utf-8")
-      req.Header.Add("X-API-KEY", "b03d027d0eb04697976fb49ef5caf680")
-    } else if _type == "WWW" {
-      // if thsi is WWW, we use differe content-type
-      req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-    }
-  }
-
-  res, err := c.client.Do(req)
-
-  response_time := time.Now().UnixNano() - t1
-
-  if err != nil {
-    log.Println("Response Time: ", float64(response_time)/1.0e9, " Error: when", _method, _url, "with error ", err)
-    c.recordError()
-    return
-  }
-
-  /*
-  ###
-  disable reading res.body, no need for our purpose for now,
-  by doing this, hope we can save more file descriptor.
-  ##
-  */
-  defer req.Body.Close()
-  defer res.Body.Close()
-
-  if _DEBUG {
-    data, err := ioutil.ReadAll(res.Body)
-    // _b, _ := ioutil.ReadAll(req.Body)
-    if err == nil {
-      log.Println("Req : ", _method, _url)
-      if _AUTH_METHOD != "none" {
-        log.Println("Authorization: ", string(req.Header.Get("Authorization")))
-      }
-      log.Println("Req Body : ", _body)
-      log.Println("Response: ", res.Status)
-      log.Println("Res Body : ", string(data))
-    } else {
-      c.recordError()
-      return
-    }
-  }
-
-  // check response code here
-  // 409 conflict is ok for PATCH request
-
-  if res.StatusCode >= 400 && res.StatusCode != 409 {
-    //fmt.Println(res.Status, string(data))
-    log.Println("Got error code --> ", res.Status, "for call ", _method, " ", _url)
-    c.recordError()
-    return
-  }
-
-  // reference --> https://github.com/tenntenn/gae-go-testing/blob/master/recorder_test.go
-
-  // only record time for "good" call
-  c.record(response_time)
-  _call.Record(response_time)
+// percentile returns the q-th percentile (q in [0, 1]) from an already-sorted
+// slice using the nearest-rank method. Returns 0 if the slice is empty.
+func percentile(sorted []float64, q float64) float64 {
+	if len(sorted) == 0 {
+		return 0
+	}
+	if q < 0 {
+		q = 0
+	}
+	if q > 1 {
+		q = 1
+	}
+	idx := int(q * float64(len(sorted)-1))
+	return sorted[idx]
 }
 
-// to print out performance counter
-// run every second, will also update last count
-func (c *Counter) pperf() {
-  sps := c.s_count - c.s_lastcount
-  pps := c.count - c.lastcount
-  c.backlog = c.s_count - c.count - c.totalerrors
-
-  atomic.StoreInt64(&c.lastcount, c.count)
-  atomic.StoreInt64(&c.s_lastcount, c.s_count)
-
-  c.avg_time = float64(c.totaltime) / (float64(c.count) * 1.0e9)
-  // c.last_avg_time = TODO!!
-
-  log.Println(" SendPS: ", fmt.Sprintf("%4d", sps),
-  " ReceivePS: ", fmt.Sprintf("%4d", pps), fmt.Sprintf("%2.4f", c.avg_time),
-  " Pending Requests: ", c.backlog,
-  " Error:", c.totalerrors,
-  "|", fmt.Sprintf("%2.2f%s", (float64(c.totalerrors)*100.0/float64(c.totalerrors+c.count)), "%"),
-  " Slow Ratio: ", fmt.Sprintf("%2.2f%s", (float64(c.totalslowresp)*100.0/float64(c.totalerrors+c.count)), "%"))
+func (c *Counter) statusBreakdown() string {
+	var b strings.Builder
+	any := false
+	for sc := 100; sc < len(c.statusCounts); sc++ {
+		if n := c.statusCounts[sc].Load(); n > 0 {
+			fmt.Fprintf(&b, "  %d: %d\n", sc, n)
+			any = true
+		}
+	}
+	if !any {
+		b.WriteString("  (none)\n")
+	}
+	return b.String()
 }
 
-// routine to return status
-func (c *Counter) stats(res http.ResponseWriter, req *http.Request) {
-  res.Header().Set(
-    "Content-Type", "text/plain",
-  )
-  io.WriteString(
-    res,
-    fmt.Sprintf("Total Request: %d\nTotal Error: %d\n==========\n%s",
-    c.count, c.totalerrors, string(TrafficProfile.Print())),
-  )
+func (c *Counter) netErrBreakdown() string {
+	var b strings.Builder
+	any := false
+	for cat := netErrCanceled; cat < netErrCategory(len(c.netErrCounts)); cat++ {
+		if n := c.netErrCounts[cat].Load(); n > 0 {
+			fmt.Fprintf(&b, "  %s: %d\n", netErrCategoryNames[cat], n)
+			any = true
+		}
+	}
+	if !any {
+		return ""
+	}
+	return b.String()
 }
 
-func index(res http.ResponseWriter, req *http.Request) {
-  res.Header().Set(
-    "Content-Type",
-    "text/html",
-  )
-  io.WriteString(
-    res,
-    `test`,
-  )
+func (c *Counter) report() {
+	c.latMu.Lock()
+	samples := append([]float64(nil), c.latMs...)
+	c.latMu.Unlock()
+	sort.Float64s(samples)
+
+	fmt.Println()
+	fmt.Println("=== Summary ===")
+	fmt.Printf("Sent:     %d\n", c.sentCount.Load())
+	fmt.Printf("Received: %d\n", c.recvCount.Load())
+	fmt.Printf("Errors:   %d\n", c.errCount.Load())
+	if canceled := c.canceledCount.Load(); canceled > 0 {
+		fmt.Printf("Canceled: %d  (in-flight at shutdown)\n", canceled)
+	}
+	fmt.Printf("Slow:     %d  (> %s)\n", c.slowCount.Load(), c.slowThreshold)
+
+	fmt.Println()
+	fmt.Println("Status codes:")
+	fmt.Print(c.statusBreakdown())
+
+	if netErrs := c.netErrBreakdown(); netErrs != "" {
+		fmt.Println()
+		fmt.Println("Network errors:")
+		fmt.Print(netErrs)
+	}
+
+	if len(samples) == 0 {
+		fmt.Println()
+		fmt.Println("No successful samples; latency stats unavailable.")
+		return
+	}
+	var sum float64
+	for _, v := range samples {
+		sum += v
+	}
+	mean := sum / float64(len(samples))
+	fmt.Println()
+	fmt.Printf("Latency (ms):  min=%.2f  mean=%.2f  p50=%.2f  p90=%.2f  p95=%.2f  p99=%.2f  max=%.2f\n",
+		samples[0],
+		mean,
+		percentile(samples, 0.50),
+		percentile(samples, 0.90),
+		percentile(samples, 0.95),
+		percentile(samples, 0.99),
+		samples[len(samples)-1])
+
+	fmt.Println()
+	fmt.Println("--- Per call ---")
+	fmt.Print(c.profile.Print())
 }
 
-func (c *Counter) run_once(pps time.Duration) {
-  _interval := 1000000000.0 / pps
-  /*
-  _send_per_tick := 1
-  if pps > 400 {
-    _send_per_tick = 5
-    _interval = 1000000000.0 * 5 / pps
-    log.Println("dount the per tick sending...")
-  }
-  */
-  c.throttle = time.Tick(_interval * time.Nanosecond)
+// --- JSON report --------------------------------------------------------
 
-  // fmt.println _users
-
-  go func() {
-    for {
-      <-c.throttle // rate limit our Service.Method RPCs
-      go c.hammer()
-      /*
-      if _send_per_tick > 1 {
-        // send two per tick for very high RPS to be more accurate
-        go c.hammer()
-        go c.hammer()
-        go c.hammer()
-        go c.hammer()
-      }
-      */
-    }
-  }()
+type LatencyReport struct {
+	Samples int     `json:"samples"`
+	Min     float64 `json:"min"`
+	Mean    float64 `json:"mean"`
+	P50     float64 `json:"p50"`
+	P90     float64 `json:"p90"`
+	P95     float64 `json:"p95"`
+	P99     float64 `json:"p99"`
+	Max     float64 `json:"max"`
 }
 
-func (c *Counter) findPPS(_p int64) {
-  var _rps time.Duration
-
-  _rps = time.Duration(_p)
-  log.Println(_rps)
-  // already a gorouting, we just do a infinity loop to find the best RPS
-  for {
-    c.run_once(_rps)
-    log.Println("Run RPS -> ", int(_rps))
-    _result := <-c.runinfo
-    log.Println(_result)
-
-    // now we know pass of failed, we can start adjust _rps
-    if _result {
-      // first, we want make sure we can exit the run, that is
-      // if the good and failed RPS is within 5 RPS (will change
-      // to 5% later), we can assume we found what we are looking for
-      c.lastGoodRPS = _rps
-      if (c.lastGoodRPS*c.lastBadRPS > 0) && (c.lastGoodRPS-c.lastBadRPS < 5) {
-        log.Println("found it!", _rps)
-        // additional report and then quit the process
-      }
-    } else {
-      c.lastBadRPS = _rps
-    }
-    // not found, keep running, next RPS will be (good + bad ) / 2
-    if c.lastBadRPS == 0 {
-      _rps = c.lastGoodRPS * 2
-    } else if c.lastGoodRPS == 0 {
-      _rps = c.lastGoodRPS / 2
-    } else {
-      _rps = (c.lastGoodRPS + c.lastBadRPS) / 2
-    }
-  }
+type StatusBucket struct {
+	Code  int   `json:"code"`
+	Count int64 `json:"count"`
 }
 
-// init the program from command line
-var initRPS int64
-var profileFile string
-var initKey string
-var initSecret string
-var nodeidFile string
-var host string
-var proxy string
-
-func init() {
-  //var env string
-
-  flag.Int64Var(&initRPS, "rps", 100, "set RPS")
-  flag.StringVar(&profileFile, "profile", "", "traffic profile")
-  flag.StringVar(&host, "host", "api.mobile.walmart.com", "server host address")
-  flag.BoolVar(&_DEBUG, "debug", false, "set debug flag")
-  flag.StringVar(&_AUTH_METHOD, "auth", "none", "set authorization flag (oauth|none)")
-  flag.StringVar(&proxy, "proxy", "none", "Set HTTP proxy (need to specify scheme. e.g. http://127.0.0.1:8888)")
-  flag.StringVar(&initKey, "oauthkey", "8e83a8372268", "set oauth key")
-  flag.StringVar(&initSecret, "oauthsecret", "24d643594f7cf03a52f5f6fe7c1b60dd", "set oauth secret")
-  //flag.StringVar(&env, "env", "staging", "set testing environment")
-
-  oauth_client.Credentials.Token = initKey
-  oauth_client.Credentials.Secret = initSecret
-
-  _AUTH_METHOD = strings.ToLower(_AUTH_METHOD)
+type NetErrBucket struct {
+	Category string `json:"category"`
+	Count    int64  `json:"count"`
 }
 
-// main func
+type CallReport struct {
+	Method   string  `json:"method"`
+	URL      string  `json:"url"`
+	Count    int64   `json:"count"`
+	AvgRTSec float64 `json:"avg_rt_sec"`
+}
+
+type JSONReport struct {
+	StartTime        time.Time      `json:"start_time"`
+	EndTime          time.Time      `json:"end_time"`
+	DurationSec      float64        `json:"duration_sec"`
+	TargetRPS        int            `json:"target_rps"`
+	Profile          string         `json:"profile"`
+	Sent             int64          `json:"sent"`
+	Received         int64          `json:"received"`
+	Errors           int64          `json:"errors"`
+	Canceled         int64          `json:"canceled"`
+	Slow             int64          `json:"slow"`
+	SlowThresholdSec float64        `json:"slow_threshold_sec"`
+	StatusCodes      []StatusBucket `json:"status_codes"`
+	NetworkErrors    []NetErrBucket `json:"network_errors"`
+	LatencyMs        LatencyReport  `json:"latency_ms"`
+	PerCall          []CallReport   `json:"per_call"`
+}
+
+func (c *Counter) buildJSONReport(start, end time.Time, rps int, profilePath string) *JSONReport {
+	c.latMu.Lock()
+	samples := append([]float64(nil), c.latMs...)
+	c.latMu.Unlock()
+	sort.Float64s(samples)
+
+	var lat LatencyReport
+	if n := len(samples); n > 0 {
+		var sum float64
+		for _, v := range samples {
+			sum += v
+		}
+		lat = LatencyReport{
+			Samples: n,
+			Min:     samples[0],
+			Mean:    sum / float64(n),
+			P50:     percentile(samples, 0.50),
+			P90:     percentile(samples, 0.90),
+			P95:     percentile(samples, 0.95),
+			P99:     percentile(samples, 0.99),
+			Max:     samples[n-1],
+		}
+	}
+
+	statuses := make([]StatusBucket, 0)
+	for sc := 100; sc < len(c.statusCounts); sc++ {
+		if n := c.statusCounts[sc].Load(); n > 0 {
+			statuses = append(statuses, StatusBucket{Code: sc, Count: n})
+		}
+	}
+
+	netErrs := make([]NetErrBucket, 0)
+	for cat := netErrCanceled; cat < netErrCategory(len(c.netErrCounts)); cat++ {
+		if n := c.netErrCounts[cat].Load(); n > 0 {
+			netErrs = append(netErrs, NetErrBucket{Category: netErrCategoryNames[cat], Count: n})
+		}
+	}
+
+	calls := make([]CallReport, 0, len(c.profile.Calls()))
+	for _, pc := range c.profile.Calls() {
+		n := pc.Count()
+		var avg float64
+		if n > 0 {
+			avg = float64(pc.TotalTimeNs()) / float64(n) / 1e9
+		}
+		calls = append(calls, CallReport{
+			Method:   pc.Method,
+			URL:      pc.URL,
+			Count:    n,
+			AvgRTSec: avg,
+		})
+	}
+
+	return &JSONReport{
+		StartTime:        start,
+		EndTime:          end,
+		DurationSec:      end.Sub(start).Seconds(),
+		TargetRPS:        rps,
+		Profile:          profilePath,
+		Sent:             c.sentCount.Load(),
+		Received:         c.recvCount.Load(),
+		Errors:           c.errCount.Load(),
+		Canceled:         c.canceledCount.Load(),
+		Slow:             c.slowCount.Load(),
+		SlowThresholdSec: c.slowThreshold.Seconds(),
+		StatusCodes:      statuses,
+		NetworkErrors:    netErrs,
+		LatencyMs:        lat,
+		PerCall:          calls,
+	}
+}
+
+func writeJSONReport(path string, r *JSONReport) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	enc := json.NewEncoder(f)
+	enc.SetIndent("", "  ")
+	return enc.Encode(r)
+}
+
+// parseExtraOKCodes parses a comma-separated list of status codes
+// (e.g. "404,409") into a set, validating each code is in [100, 599].
+func parseExtraOKCodes(s string) (map[int]bool, error) {
+	out := map[int]bool{}
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return out, nil
+	}
+	for _, tok := range strings.Split(s, ",") {
+		tok = strings.TrimSpace(tok)
+		if tok == "" {
+			continue
+		}
+		n, err := strconv.Atoi(tok)
+		if err != nil {
+			return nil, fmt.Errorf("invalid status code %q", tok)
+		}
+		if n < 100 || n >= 600 {
+			return nil, fmt.Errorf("status code %d out of range [100, 599]", n)
+		}
+		out[n] = true
+	}
+	return out, nil
+}
+
 func main() {
-  // rate_per_sec := 10
-  // throttle := time.Tick( 15 * time.Millisecond)
-  // const NCPU = 16
+	var (
+		rps           int
+		profileFile   string
+		duration      time.Duration
+		timeout       time.Duration
+		slowThreshold time.Duration
+		proxy         string
+		insecureTLS   bool
+		debug         bool
+		statsAddr     string
+		extraOKList   string
+		jsonOut       string
+	)
 
-  NCPU := runtime.NumCPU()
-  log.Println("# of CPU is ", NCPU)
+	flag.IntVar(&rps, "rps", 100, "requests per second")
+	flag.StringVar(&profileFile, "profile", "", "path to traffic profile JSON file (required)")
+	flag.DurationVar(&duration, "duration", 0, "total duration to run; 0 means run until interrupted")
+	flag.DurationVar(&timeout, "timeout", 30*time.Second, "per-request HTTP timeout")
+	flag.DurationVar(&slowThreshold, "slow", time.Second, "log responses slower than this threshold")
+	flag.StringVar(&proxy, "proxy", "", "HTTP proxy URL (e.g. http://127.0.0.1:8888)")
+	flag.BoolVar(&insecureTLS, "insecure", false, "skip TLS certificate verification")
+	flag.BoolVar(&debug, "debug", false, "verbose request/response logging")
+	flag.StringVar(&statsAddr, "stats-addr", ":9001", "address to serve /stats endpoint on (empty to disable)")
+	flag.StringVar(&extraOKList, "ok", "", "extra status codes treated as success (comma-separated, e.g. \"404,409\")")
+	flag.StringVar(&jsonOut, "json-out", "", "path to write a structured JSON report on exit (empty to skip)")
+	flag.Parse()
 
-  runtime.GOMAXPROCS(NCPU + 3)
+	if profileFile == "" {
+		fmt.Fprintln(os.Stderr, "Error: -profile is required")
+		flag.Usage()
+		os.Exit(2)
+	}
+	if rps <= 0 {
+		fmt.Fprintln(os.Stderr, "Error: -rps must be positive")
+		os.Exit(2)
+	}
 
-  flag.Parse()
-  log.Println("proxy -> ", proxy)
-  log.Println("RPS is", initRPS)
+	extraOK, err := parseExtraOKCodes(extraOKList)
+	if err != nil {
+		log.Fatalf("parse -ok: %v", err)
+	}
 
-  if profileFile != "" {
-    log.Println("Profile is", profileFile)
-    TrafficProfile.InitProfileFromFile(profileFile)
-  } else {
-    TrafficProfile.Init(host)
-    //TrafficProfile.Init(nodeidFile, depth, host)
-  }
+	prof, err := profile.LoadFromFile(profileFile)
+	if err != nil {
+		log.Fatalf("load profile: %v", err)
+	}
 
-  rand.Seed(time.Now().UnixNano())
+	c, err := newCounter(prof, timeout, slowThreshold, proxy, insecureTLS, debug, extraOK)
+	if err != nil {
+		log.Fatalf("init: %v", err)
+	}
 
-  counter := new(Counter)
-  counter._init()
+	parentCtx, signalCancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer signalCancel()
 
-  go func() {
-    counter.findPPS(initRPS)
-  }()
+	// Drive shutdown through a single cancel() so in-flight requests
+	// always end with context.Canceled — whether the run ends via a
+	// signal or via -duration. That keeps the "timeout" bucket meaning
+	// "per-request HTTP timeout exceeded" only.
+	ctx, runCancel := context.WithCancel(parentCtx)
+	defer runCancel()
+	if duration > 0 {
+		t := time.AfterFunc(duration, runCancel)
+		defer t.Stop()
+	}
 
-  // start web interface here, which returns only stats in text format
-  http.HandleFunc("/", index)
-  http.HandleFunc("/test", func(res http.ResponseWriter, req *http.Request) {
-    log.Println("receive request")
-    counter.stats(res, req)
-  })
-  http.ListenAndServe(":9001", nil)
+	if statsAddr != "" {
+		mux := http.NewServeMux()
+		mux.HandleFunc("/stats", func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			fmt.Fprintf(w, "Sent: %d\nReceived: %d\nErrors: %d\nCanceled: %d\n",
+				c.sentCount.Load(), c.recvCount.Load(), c.errCount.Load(), c.canceledCount.Load())
+			fmt.Fprintf(w, "\nStatus codes:\n%s", c.statusBreakdown())
+			if netErrs := c.netErrBreakdown(); netErrs != "" {
+				fmt.Fprintf(w, "\nNetwork errors:\n%s", netErrs)
+			}
+			fmt.Fprintf(w, "\n==========\n%s", prof.Print())
+		})
+		srv := &http.Server{Addr: statsAddr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+		go func() {
+			if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				log.Printf("stats server: %v", err)
+			}
+		}()
+		defer func() {
+			shutdownCtx, cc := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cc()
+			_ = srv.Shutdown(shutdownCtx)
+		}()
+		log.Printf("Stats endpoint: http://%s/stats", statsAddr)
+	}
 
-  // this will block the program, we may add a targe # of msg here.
-  var input string
-  fmt.Scanln(&input)
+	interval := time.Second / time.Duration(rps)
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	monitor := time.NewTicker(time.Second)
+	defer monitor.Stop()
+
+	durLabel := "until interrupted"
+	if duration > 0 {
+		durLabel = "for " + duration.String()
+	}
+	log.Printf("Hammering @ %d rps %s (timeout=%s, profile=%s)", rps, durLabel, timeout, profileFile)
+	startTime := time.Now()
+
+LOOP:
+	for {
+		select {
+		case <-ctx.Done():
+			break LOOP
+		case <-monitor.C:
+			c.tick()
+		case <-ticker.C:
+			go c.hammer(ctx)
+		}
+	}
+	endTime := time.Now()
+
+	log.Println("Stopping...")
+	c.report()
+
+	if jsonOut != "" {
+		r := c.buildJSONReport(startTime, endTime, rps, profileFile)
+		if err := writeJSONReport(jsonOut, r); err != nil {
+			log.Printf("write json report: %v", err)
+		} else {
+			log.Printf("JSON report written to %s", jsonOut)
+		}
+	}
 }
