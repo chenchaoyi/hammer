@@ -1,5 +1,9 @@
 # Hammer
 
+[![ci](https://github.com/chenchaoyi/hammer/actions/workflows/ci.yml/badge.svg)](https://github.com/chenchaoyi/hammer/actions/workflows/ci.yml)
+[![release](https://img.shields.io/github/v/release/chenchaoyi/hammer?logo=github&label=release)](https://github.com/chenchaoyi/hammer/releases/latest)
+[![license](https://img.shields.io/github/license/chenchaoyi/hammer)](LICENSE)
+
 Lightweight, single-binary HTTP(S) load generator written in Go.
 
 - **Constant-rate**: drives a configurable RPS using a tick loop

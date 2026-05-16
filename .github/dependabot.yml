@@ -1,0 +1,20 @@
+version: 2
+updates:
+  # Keep Go module deps fresh (currently stdlib-only, so this is mostly
+  # forward-looking for when a dep is added).
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: deps
+
+  # Keep GitHub Actions versions (setup-go, action-gh-release, …) current.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: ci
