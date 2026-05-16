@@ -171,6 +171,22 @@ func (c *Counter) tick() {
 		float64(slow)*100/float64(denom))
 }
 
+// percentile returns the q-th percentile (q in [0, 1]) from an already-sorted
+// slice using the nearest-rank method. Returns 0 if the slice is empty.
+func percentile(sorted []float64, q float64) float64 {
+	if len(sorted) == 0 {
+		return 0
+	}
+	if q < 0 {
+		q = 0
+	}
+	if q > 1 {
+		q = 1
+	}
+	idx := int(q * float64(len(sorted)-1))
+	return sorted[idx]
+}
+
 func (c *Counter) report() {
 	c.latMu.Lock()
 	samples := append([]float64(nil), c.latMs...)
@@ -188,12 +204,13 @@ func (c *Counter) report() {
 		fmt.Println("No successful samples; latency stats unavailable.")
 		return
 	}
-	pct := func(q float64) float64 {
-		idx := int(q * float64(len(samples)-1))
-		return samples[idx]
-	}
 	fmt.Printf("Latency (ms):  min=%.2f  p50=%.2f  p90=%.2f  p95=%.2f  p99=%.2f  max=%.2f\n",
-		samples[0], pct(0.50), pct(0.90), pct(0.95), pct(0.99), samples[len(samples)-1])
+		samples[0],
+		percentile(samples, 0.50),
+		percentile(samples, 0.90),
+		percentile(samples, 0.95),
+		percentile(samples, 0.99),
+		samples[len(samples)-1])
 
 	fmt.Println()
 	fmt.Println("--- Per call ---")
