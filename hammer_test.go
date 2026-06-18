@@ -526,6 +526,127 @@ func TestParseExtraOKCodes(t *testing.T) {
 	}
 }
 
+func TestHeaderFlag(t *testing.T) {
+	h := headerFlag{}
+	for _, in := range []string{"Authorization: Bearer t", "X-Trace:abc", "Empty-Val:"} {
+		if err := h.Set(in); err != nil {
+			t.Fatalf("Set(%q): %v", in, err)
+		}
+	}
+	if h["Authorization"] != "Bearer t" {
+		t.Errorf("Authorization=%q", h["Authorization"])
+	}
+	if h["X-Trace"] != "abc" {
+		t.Errorf("X-Trace=%q", h["X-Trace"])
+	}
+	if v, ok := h["Empty-Val"]; !ok || v != "" {
+		t.Errorf("Empty-Val=%q ok=%v, want empty present", v, ok)
+	}
+	// Malformed inputs are rejected.
+	for _, bad := range []string{"no-colon", ": novalue"} {
+		if err := (headerFlag{}).Set(bad); err == nil {
+			t.Errorf("Set(%q) should fail", bad)
+		}
+	}
+}
+
+func TestErrorRate(t *testing.T) {
+	tests := []struct {
+		recv, errs int64
+		want       float64
+	}{
+		{0, 0, 0},
+		{100, 0, 0},
+		{0, 5, 1},
+		{90, 10, 0.1},
+	}
+	for _, tc := range tests {
+		if got := errorRate(tc.recv, tc.errs); got != tc.want {
+			t.Errorf("errorRate(%d,%d)=%v, want %v", tc.recv, tc.errs, got, tc.want)
+		}
+	}
+}
+
+func TestThresholds_configured(t *testing.T) {
+	if (thresholds{maxErrorRate: -1}).configured() {
+		t.Error("all-disabled thresholds should report not configured")
+	}
+	if !(thresholds{maxErrorRate: 0}).configured() {
+		t.Error("max-error-rate 0 should be configured")
+	}
+	if !(thresholds{maxP99: time.Millisecond}).configured() {
+		t.Error("max-p99 should be configured")
+	}
+}
+
+func TestThresholds_evaluate(t *testing.T) {
+	r := &JSONReport{
+		ErrorRate: 0.02,
+		LatencyMs: LatencyReport{P50: 10, P95: 80, P99: 150},
+	}
+
+	// No thresholds → nil report.
+	if got := (thresholds{maxErrorRate: -1}).evaluate(r); got != nil {
+		t.Errorf("expected nil checks when unconfigured, got %+v", got)
+	}
+
+	// Error rate over the limit, p99 under it → overall FAIL.
+	thr := thresholds{maxErrorRate: 0.01, maxP99: 500 * time.Millisecond}
+	cr := thr.evaluate(r)
+	if cr == nil {
+		t.Fatal("expected a checks report")
+	}
+	if cr.Passed {
+		t.Error("expected Passed=false (error rate exceeds limit)")
+	}
+	if len(cr.Results) != 2 {
+		t.Fatalf("results=%d, want 2", len(cr.Results))
+	}
+	byName := map[string]CheckResult{}
+	for _, res := range cr.Results {
+		byName[res.Name] = res
+	}
+	if er := byName["error_rate"]; er.OK || er.Actual != 0.02 || er.Limit != 0.01 {
+		t.Errorf("error_rate check = %+v", er)
+	}
+	if p := byName["p99_ms"]; !p.OK || p.Limit != 500 || p.Actual != 150 {
+		t.Errorf("p99_ms check = %+v", p)
+	}
+
+	// All within limits → PASS.
+	pass := thresholds{maxErrorRate: 0.05, maxP50: 50 * time.Millisecond, maxP95: 100 * time.Millisecond}
+	if cr := pass.evaluate(r); cr == nil || !cr.Passed {
+		t.Errorf("expected all-pass, got %+v", cr)
+	}
+}
+
+func TestBuildJSONReport_includesDerivedMetrics(t *testing.T) {
+	codes := []int{200, 200, 200, 500}
+	var idx atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		i := int(idx.Add(1)-1) % len(codes)
+		w.WriteHeader(codes[i])
+	}))
+	defer srv.Close()
+
+	prof := loadOneCallProfile(t, srv.URL, "GET", "", "")
+	c := newTestCounter(t, prof, time.Second, time.Second)
+	for i := 0; i < len(codes); i++ {
+		c.hammer(context.Background())
+	}
+
+	start := time.Now().Add(-2 * time.Second)
+	r := c.buildJSONReport(start, time.Now(), 100, "fake.json")
+
+	// 1 error out of 4 completed → 0.25.
+	if r.ErrorRate != 0.25 {
+		t.Errorf("ErrorRate=%v, want 0.25", r.ErrorRate)
+	}
+	if r.AchievedRPS <= 0 {
+		t.Errorf("AchievedRPS=%v, want > 0", r.AchievedRPS)
+	}
+}
+
 func make100() []float64 {
 	v := make([]float64, 100)
 	for i := range v {
@@ -536,17 +657,17 @@ func make100() []float64 {
 
 func TestPercentile(t *testing.T) {
 	tests := []struct {
-		name   string
-		input  []float64
-		q      float64
-		want   float64
+		name  string
+		input []float64
+		q     float64
+		want  float64
 	}{
 		{"empty", nil, 0.5, 0},
 		{"single", []float64{42}, 0.5, 42},
 		{"p50", []float64{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}, 0.50, 5},
 		{"p90", []float64{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}, 0.90, 9},
-		{"p99-of-10", []float64{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}, 0.99, 9},  // int(0.99*9)=8 → 9
-		{"p99-of-100", make100(), 0.99, 99},                                  // int(0.99*99)=98 → values[98]=99
+		{"p99-of-10", []float64{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}, 0.99, 9}, // int(0.99*9)=8 → 9
+		{"p99-of-100", make100(), 0.99, 99},                              // int(0.99*99)=98 → values[98]=99
 		{"min", []float64{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}, 0, 1},
 		{"q-clamped-low", []float64{1, 2, 3}, -1, 1},
 		{"q-clamped-high", []float64{1, 2, 3}, 2, 3},

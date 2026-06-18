@@ -102,6 +102,7 @@ type Counter struct {
 	client  *http.Client
 	profile *profile.Profile
 	debug   bool
+	quiet   bool // suppress per-response "Slow response" lines
 }
 
 func newCounter(p *profile.Profile, timeout, slow time.Duration, proxyURL string, insecureTLS, debug bool, extraOK map[int]bool) (*Counter, error) {
@@ -228,7 +229,9 @@ func (c *Counter) hammer(ctx context.Context) {
 	c.totalTimeNs.Add(elapsed.Nanoseconds())
 	if elapsed > c.slowThreshold {
 		c.slowCount.Add(1)
-		log.Printf("Slow response %s -> %s %s", elapsed, method, u)
+		if !c.quiet {
+			log.Printf("Slow response %s -> %s %s", elapsed, method, u)
+		}
 	}
 
 	call.Record(elapsed.Nanoseconds())
@@ -313,35 +316,38 @@ func (c *Counter) netErrBreakdown() string {
 	return b.String()
 }
 
-func (c *Counter) report() {
+// report writes the human-readable summary to w. checks may be nil when no
+// SLO thresholds were configured.
+func (c *Counter) report(w io.Writer, checks *ChecksReport) {
 	c.latMu.Lock()
 	samples := append([]float64(nil), c.latMs...)
 	c.latMu.Unlock()
 	sort.Float64s(samples)
 
-	fmt.Println()
-	fmt.Println("=== Summary ===")
-	fmt.Printf("Sent:     %d\n", c.sentCount.Load())
-	fmt.Printf("Received: %d\n", c.recvCount.Load())
-	fmt.Printf("Errors:   %d\n", c.errCount.Load())
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "=== Summary ===")
+	fmt.Fprintf(w, "Sent:     %d\n", c.sentCount.Load())
+	fmt.Fprintf(w, "Received: %d\n", c.recvCount.Load())
+	fmt.Fprintf(w, "Errors:   %d\n", c.errCount.Load())
 	if canceled := c.canceledCount.Load(); canceled > 0 {
-		fmt.Printf("Canceled: %d  (in-flight at shutdown)\n", canceled)
+		fmt.Fprintf(w, "Canceled: %d  (in-flight at shutdown)\n", canceled)
 	}
-	fmt.Printf("Slow:     %d  (> %s)\n", c.slowCount.Load(), c.slowThreshold)
+	fmt.Fprintf(w, "Slow:     %d  (> %s)\n", c.slowCount.Load(), c.slowThreshold)
 
-	fmt.Println()
-	fmt.Println("Status codes:")
-	fmt.Print(c.statusBreakdown())
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "Status codes:")
+	fmt.Fprint(w, c.statusBreakdown())
 
 	if netErrs := c.netErrBreakdown(); netErrs != "" {
-		fmt.Println()
-		fmt.Println("Network errors:")
-		fmt.Print(netErrs)
+		fmt.Fprintln(w)
+		fmt.Fprintln(w, "Network errors:")
+		fmt.Fprint(w, netErrs)
 	}
 
 	if len(samples) == 0 {
-		fmt.Println()
-		fmt.Println("No successful samples; latency stats unavailable.")
+		fmt.Fprintln(w)
+		fmt.Fprintln(w, "No successful samples; latency stats unavailable.")
+		printChecks(w, checks)
 		return
 	}
 	var sum float64
@@ -349,8 +355,8 @@ func (c *Counter) report() {
 		sum += v
 	}
 	mean := sum / float64(len(samples))
-	fmt.Println()
-	fmt.Printf("Latency (ms):  min=%.2f  mean=%.2f  p50=%.2f  p90=%.2f  p95=%.2f  p99=%.2f  max=%.2f\n",
+	fmt.Fprintln(w)
+	fmt.Fprintf(w, "Latency (ms):  min=%.2f  mean=%.2f  p50=%.2f  p90=%.2f  p95=%.2f  p99=%.2f  max=%.2f\n",
 		samples[0],
 		mean,
 		percentile(samples, 0.50),
@@ -359,9 +365,34 @@ func (c *Counter) report() {
 		percentile(samples, 0.99),
 		samples[len(samples)-1])
 
-	fmt.Println()
-	fmt.Println("--- Per call ---")
-	fmt.Print(c.profile.Print())
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "--- Per call ---")
+	fmt.Fprint(w, c.profile.Print())
+
+	printChecks(w, checks)
+}
+
+// printChecks renders the SLO threshold results, if any were configured.
+func printChecks(w io.Writer, checks *ChecksReport) {
+	if checks == nil || len(checks.Results) == 0 {
+		return
+	}
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "=== Checks ===")
+	for _, r := range checks.Results {
+		status := "PASS"
+		cmp := "<="
+		if !r.OK {
+			status = "FAIL"
+			cmp = ">"
+		}
+		fmt.Fprintf(w, "  %-12s %.4g %s %.4g %s  %s\n", r.Name, r.Actual, cmp, r.Limit, r.Unit, status)
+	}
+	verdict := "PASS"
+	if !checks.Passed {
+		verdict = "FAIL"
+	}
+	fmt.Fprintf(w, "RESULT: %s\n", verdict)
 }
 
 // --- JSON report --------------------------------------------------------
@@ -394,22 +425,41 @@ type CallReport struct {
 	AvgRTSec float64 `json:"avg_rt_sec"`
 }
 
+// CheckResult is the outcome of evaluating one SLO threshold.
+type CheckResult struct {
+	Name   string  `json:"name"`
+	Limit  float64 `json:"limit"`
+	Actual float64 `json:"actual"`
+	Unit   string  `json:"unit"`
+	OK     bool    `json:"ok"`
+}
+
+// ChecksReport aggregates every configured SLO threshold and the overall
+// pass/fail verdict that drives hammer's exit code.
+type ChecksReport struct {
+	Passed  bool          `json:"passed"`
+	Results []CheckResult `json:"results"`
+}
+
 type JSONReport struct {
 	StartTime        time.Time      `json:"start_time"`
 	EndTime          time.Time      `json:"end_time"`
 	DurationSec      float64        `json:"duration_sec"`
 	TargetRPS        int            `json:"target_rps"`
+	AchievedRPS      float64        `json:"achieved_rps"`
 	Profile          string         `json:"profile"`
 	Sent             int64          `json:"sent"`
 	Received         int64          `json:"received"`
 	Errors           int64          `json:"errors"`
 	Canceled         int64          `json:"canceled"`
 	Slow             int64          `json:"slow"`
+	ErrorRate        float64        `json:"error_rate"`
 	SlowThresholdSec float64        `json:"slow_threshold_sec"`
 	StatusCodes      []StatusBucket `json:"status_codes"`
 	NetworkErrors    []NetErrBucket `json:"network_errors"`
 	LatencyMs        LatencyReport  `json:"latency_ms"`
 	PerCall          []CallReport   `json:"per_call"`
+	Checks           *ChecksReport  `json:"checks,omitempty"`
 }
 
 func (c *Counter) buildJSONReport(start, end time.Time, rps int, profilePath string) *JSONReport {
@@ -465,17 +515,27 @@ func (c *Counter) buildJSONReport(start, end time.Time, rps int, profilePath str
 		})
 	}
 
+	received := c.recvCount.Load()
+	errs := c.errCount.Load()
+	durSec := end.Sub(start).Seconds()
+	achieved := 0.0
+	if durSec > 0 {
+		achieved = float64(received) / durSec
+	}
+
 	return &JSONReport{
 		StartTime:        start,
 		EndTime:          end,
-		DurationSec:      end.Sub(start).Seconds(),
+		DurationSec:      durSec,
 		TargetRPS:        rps,
+		AchievedRPS:      achieved,
 		Profile:          profilePath,
 		Sent:             c.sentCount.Load(),
-		Received:         c.recvCount.Load(),
-		Errors:           c.errCount.Load(),
+		Received:         received,
+		Errors:           errs,
 		Canceled:         c.canceledCount.Load(),
 		Slow:             c.slowCount.Load(),
+		ErrorRate:        errorRate(received, errs),
 		SlowThresholdSec: c.slowThreshold.Seconds(),
 		StatusCodes:      statuses,
 		NetworkErrors:    netErrs,
@@ -484,15 +544,91 @@ func (c *Counter) buildJSONReport(start, end time.Time, rps int, profilePath str
 	}
 }
 
+// errorRate is errors / (errors + received). It returns 0 when nothing was
+// completed, so an idle run never looks like a failure.
+func errorRate(received, errors int64) float64 {
+	denom := received + errors
+	if denom == 0 {
+		return 0
+	}
+	return float64(errors) / float64(denom)
+}
+
+// thresholds holds the optional SLO limits an agent can assert on. A zero
+// duration (or negative rate) means "not configured".
+type thresholds struct {
+	maxErrorRate float64       // <0 disables
+	maxP50       time.Duration // 0 disables
+	maxP95       time.Duration
+	maxP99       time.Duration
+}
+
+func (t thresholds) configured() bool {
+	return t.maxErrorRate >= 0 || t.maxP50 > 0 || t.maxP95 > 0 || t.maxP99 > 0
+}
+
+// evaluate compares a finished run against the configured thresholds and
+// returns a ChecksReport, or nil when no thresholds were set.
+func (t thresholds) evaluate(r *JSONReport) *ChecksReport {
+	if !t.configured() {
+		return nil
+	}
+	cr := &ChecksReport{Passed: true}
+	add := func(name string, limit, actual float64, unit string) {
+		ok := actual <= limit
+		if !ok {
+			cr.Passed = false
+		}
+		cr.Results = append(cr.Results, CheckResult{
+			Name: name, Limit: limit, Actual: actual, Unit: unit, OK: ok,
+		})
+	}
+	if t.maxErrorRate >= 0 {
+		add("error_rate", t.maxErrorRate, r.ErrorRate, "")
+	}
+	if t.maxP50 > 0 {
+		add("p50_ms", float64(t.maxP50)/float64(time.Millisecond), r.LatencyMs.P50, "ms")
+	}
+	if t.maxP95 > 0 {
+		add("p95_ms", float64(t.maxP95)/float64(time.Millisecond), r.LatencyMs.P95, "ms")
+	}
+	if t.maxP99 > 0 {
+		add("p99_ms", float64(t.maxP99)/float64(time.Millisecond), r.LatencyMs.P99, "ms")
+	}
+	return cr
+}
+
+func encodeJSONReport(w io.Writer, r *JSONReport) error {
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	return enc.Encode(r)
+}
+
 func writeJSONReport(path string, r *JSONReport) error {
 	f, err := os.Create(path)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
-	enc := json.NewEncoder(f)
-	enc.SetIndent("", "  ")
-	return enc.Encode(r)
+	return encodeJSONReport(f, r)
+}
+
+// headerFlag collects repeatable -header "Key: Value" flags into a map.
+type headerFlag map[string]string
+
+func (h headerFlag) String() string { return "" }
+
+func (h headerFlag) Set(v string) error {
+	k, val, ok := strings.Cut(v, ":")
+	if !ok {
+		return fmt.Errorf("header must be in 'Key: Value' form, got %q", v)
+	}
+	k = strings.TrimSpace(k)
+	if k == "" {
+		return fmt.Errorf("header has empty name: %q", v)
+	}
+	h[k] = strings.TrimSpace(val)
+	return nil
 }
 
 // parseExtraOKCodes parses a comma-separated list of status codes
@@ -523,65 +659,163 @@ func parseExtraOKCodes(s string) (map[int]bool, error) {
 // version is overridden via -ldflags="-X main.version=..." in release builds.
 var version = "dev"
 
-func main() {
+// Exit codes. Stable and documented so agents can branch on them.
+const (
+	exitOK     = 0 // run completed; all SLO checks (if any) passed
+	exitChecks = 1 // run completed but one or more SLO thresholds were violated
+	exitUsage  = 2 // bad flags / arguments
+	exitSetup  = 3 // could not load the profile, build the client, or write output
+)
+
+func usage() {
+	out := flag.CommandLine.Output()
+	fmt.Fprintf(out, `hammer %s — lightweight, agent-friendly HTTP load generator
+
+Usage:
+  hammer -url URL [options]                 # zero-config: hammer a single URL
+  hammer -profile FILE [options]            # weighted traffic mix from a file
+  hammer -profile - [options]               # read the profile from stdin
+
+Agent-friendly options:
+  -output json    emit the structured report to stdout (logs stay on stderr)
+  -quiet          suppress the per-second progress monitor
+  -max-error-rate, -max-p50, -max-p95, -max-p99   assert SLOs; a violation exits 1
+
+Exit codes: 0 ok · 1 SLO violated · 2 usage error · 3 setup error
+
+Examples:
+  hammer -url https://api.example.com/health -rps 50 -duration 10s
+  hammer -url https://api.example.com/users -method POST \
+         -header 'Authorization: Bearer t' -body '{"x":1}' -content-type REST
+  hammer -url https://api.example.com/ -duration 30s \
+         -output json -quiet -max-error-rate 0.01 -max-p99 500ms | jq .checks
+  cat profile.json | hammer -profile - -rps 200 -duration 1m -output json
+
+Options:
+`, version)
+	flag.PrintDefaults()
+}
+
+func main() { os.Exit(run()) }
+
+func run() int {
 	var (
 		rps           int
 		profileFile   string
+		targetURL     string
+		method        string
+		body          string
+		contentType   string
 		duration      time.Duration
 		timeout       time.Duration
 		slowThreshold time.Duration
 		proxy         string
 		insecureTLS   bool
 		debug         bool
+		quiet         bool
+		output        string
 		statsAddr     string
 		extraOKList   string
 		jsonOut       string
 		showVersion   bool
+		maxErrorRate  float64
+		maxP50        time.Duration
+		maxP95        time.Duration
+		maxP99        time.Duration
 	)
+	headers := headerFlag{}
 
-	flag.IntVar(&rps, "rps", 100, "requests per second")
-	flag.StringVar(&profileFile, "profile", "", "path to traffic profile JSON file (required)")
+	flag.Usage = usage
+	flag.IntVar(&rps, "rps", 100, "target requests per second")
+	flag.StringVar(&profileFile, "profile", "", "path to a traffic profile JSON file, or \"-\" to read from stdin")
+	flag.StringVar(&targetURL, "url", "", "single target URL (zero-config mode; alternative to -profile)")
+	flag.StringVar(&method, "method", "GET", "HTTP method for -url mode")
+	flag.StringVar(&body, "body", "", "request body for -url mode (templating supported)")
+	flag.StringVar(&contentType, "content-type", "", "Content-Type for -url mode: REST, WWW, or a raw value")
+	flag.Var(headers, "header", "header for -url mode as 'Key: Value' (repeatable)")
 	flag.DurationVar(&duration, "duration", 0, "total duration to run; 0 means run until interrupted")
 	flag.DurationVar(&timeout, "timeout", 30*time.Second, "per-request HTTP timeout")
-	flag.DurationVar(&slowThreshold, "slow", time.Second, "log responses slower than this threshold")
+	flag.DurationVar(&slowThreshold, "slow", time.Second, "log + count responses slower than this threshold")
 	flag.StringVar(&proxy, "proxy", "", "HTTP proxy URL (e.g. http://127.0.0.1:8888)")
 	flag.BoolVar(&insecureTLS, "insecure", false, "skip TLS certificate verification")
 	flag.BoolVar(&debug, "debug", false, "verbose request/response logging")
-	flag.StringVar(&statsAddr, "stats-addr", ":9001", "address to serve /stats endpoint on (empty to disable)")
+	flag.BoolVar(&quiet, "quiet", false, "suppress the per-second progress monitor and info logs")
+	flag.StringVar(&output, "output", "text", "final report format: text (human) or json (machine-readable, to stdout)")
+	flag.StringVar(&statsAddr, "stats-addr", "", "address to serve a live /stats endpoint on (empty disables it)")
 	flag.StringVar(&extraOKList, "ok", "", "extra status codes treated as success (comma-separated, e.g. \"404,409\")")
-	flag.StringVar(&jsonOut, "json-out", "", "path to write a structured JSON report on exit (empty to skip)")
+	flag.StringVar(&jsonOut, "json-out", "", "also write the structured JSON report to this file path")
 	flag.BoolVar(&showVersion, "version", false, "print version and exit")
+	flag.Float64Var(&maxErrorRate, "max-error-rate", -1, "fail (exit 1) if the error rate exceeds this fraction [0,1]; -1 disables")
+	flag.DurationVar(&maxP50, "max-p50", 0, "fail (exit 1) if p50 latency exceeds this duration; 0 disables")
+	flag.DurationVar(&maxP95, "max-p95", 0, "fail (exit 1) if p95 latency exceeds this duration; 0 disables")
+	flag.DurationVar(&maxP99, "max-p99", 0, "fail (exit 1) if p99 latency exceeds this duration; 0 disables")
 	flag.Parse()
 
 	if showVersion {
 		fmt.Printf("hammer %s\n", version)
-		return
+		return exitOK
 	}
 
-	if profileFile == "" {
-		fmt.Fprintln(os.Stderr, "Error: -profile is required")
-		flag.Usage()
-		os.Exit(2)
+	// --- Validate flags ------------------------------------------------
+	switch output {
+	case "text", "json":
+	default:
+		fmt.Fprintf(os.Stderr, "Error: -output must be \"text\" or \"json\", got %q\n", output)
+		return exitUsage
 	}
 	if rps <= 0 {
 		fmt.Fprintln(os.Stderr, "Error: -rps must be positive")
-		os.Exit(2)
+		return exitUsage
+	}
+	if maxErrorRate > 1 {
+		fmt.Fprintln(os.Stderr, "Error: -max-error-rate must be in [0,1]")
+		return exitUsage
+	}
+	if targetURL != "" && profileFile != "" {
+		fmt.Fprintln(os.Stderr, "Error: pass either -url or -profile, not both")
+		return exitUsage
+	}
+	if targetURL == "" && profileFile == "" {
+		fmt.Fprintln(os.Stderr, "Error: one of -url or -profile is required")
+		flag.Usage()
+		return exitUsage
 	}
 
 	extraOK, err := parseExtraOKCodes(extraOKList)
 	if err != nil {
-		log.Fatalf("parse -ok: %v", err)
+		fmt.Fprintf(os.Stderr, "Error: parse -ok: %v\n", err)
+		return exitUsage
 	}
 
-	prof, err := profile.LoadFromFile(profileFile)
+	// --- Load the traffic profile --------------------------------------
+	var (
+		prof         *profile.Profile
+		profileLabel string
+	)
+	switch {
+	case targetURL != "":
+		prof, err = profile.SingleCall(method, targetURL, body, contentType, headers)
+		profileLabel = targetURL
+	case profileFile == "-":
+		prof, err = profile.LoadFromReader(os.Stdin)
+		profileLabel = "stdin"
+	default:
+		prof, err = profile.LoadFromFile(profileFile)
+		profileLabel = profileFile
+	}
 	if err != nil {
-		log.Fatalf("load profile: %v", err)
+		fmt.Fprintf(os.Stderr, "Error: load profile: %v\n", err)
+		return exitSetup
 	}
 
 	c, err := newCounter(prof, timeout, slowThreshold, proxy, insecureTLS, debug, extraOK)
 	if err != nil {
-		log.Fatalf("init: %v", err)
+		fmt.Fprintf(os.Stderr, "Error: init: %v\n", err)
+		return exitSetup
 	}
+	c.quiet = quiet
+
+	thr := thresholds{maxErrorRate: maxErrorRate, maxP50: maxP50, maxP95: maxP95, maxP99: maxP99}
 
 	parentCtx, signalCancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer signalCancel()
@@ -620,7 +854,9 @@ func main() {
 			defer cc()
 			_ = srv.Shutdown(shutdownCtx)
 		}()
-		log.Printf("Stats endpoint: http://%s/stats", statsAddr)
+		if !quiet {
+			log.Printf("Stats endpoint: http://%s/stats", statsAddr)
+		}
 	}
 
 	interval := time.Second / time.Duration(rps)
@@ -633,7 +869,9 @@ func main() {
 	if duration > 0 {
 		durLabel = "for " + duration.String()
 	}
-	log.Printf("Hammering @ %d rps %s (timeout=%s, profile=%s)", rps, durLabel, timeout, profileFile)
+	if !quiet {
+		log.Printf("Hammering @ %d rps %s (timeout=%s, target=%s)", rps, durLabel, timeout, profileLabel)
+	}
 	startTime := time.Now()
 
 LOOP:
@@ -642,22 +880,46 @@ LOOP:
 		case <-ctx.Done():
 			break LOOP
 		case <-monitor.C:
-			c.tick()
+			if !quiet {
+				c.tick()
+			}
 		case <-ticker.C:
 			go c.hammer(ctx)
 		}
 	}
 	endTime := time.Now()
 
-	log.Println("Stopping...")
-	c.report()
+	if !quiet {
+		log.Println("Stopping...")
+	}
+
+	// Build the report once; render it as text or JSON, and reuse it for
+	// both the optional -json-out file and the SLO checks / exit code.
+	r := c.buildJSONReport(startTime, endTime, rps, profileLabel)
+	checks := thr.evaluate(r)
+	r.Checks = checks
+
+	if output == "json" {
+		if err := encodeJSONReport(os.Stdout, r); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: encode report: %v\n", err)
+			return exitSetup
+		}
+	} else {
+		c.report(os.Stdout, checks)
+	}
 
 	if jsonOut != "" {
-		r := c.buildJSONReport(startTime, endTime, rps, profileFile)
 		if err := writeJSONReport(jsonOut, r); err != nil {
-			log.Printf("write json report: %v", err)
-		} else {
+			fmt.Fprintf(os.Stderr, "Error: write json report: %v\n", err)
+			return exitSetup
+		}
+		if !quiet {
 			log.Printf("JSON report written to %s", jsonOut)
 		}
 	}
+
+	if checks != nil && !checks.Passed {
+		return exitChecks
+	}
+	return exitOK
 }
