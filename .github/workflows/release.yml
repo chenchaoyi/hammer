@@ -4,6 +4,11 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release tag to create (e.g. v1.1.0)'
+        required: true
 
 permissions:
   contents: write
@@ -20,13 +25,25 @@ jobs:
           go-version-file: go.mod
           check-latest: true
 
+      - name: Resolve version
+        id: version
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ inputs.version }}"
+          else
+            VERSION="${GITHUB_REF#refs/tags/}"
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Releasing ${VERSION}"
+
       - name: Run tests
         run: go test -race ./...
 
       - name: Build cross-platform binaries
         run: |
           set -euo pipefail
-          VERSION="${GITHUB_REF#refs/tags/}"
+          VERSION="${{ steps.version.outputs.version }}"
           mkdir -p dist
 
           targets=(
@@ -74,6 +91,7 @@ jobs:
       - name: Create release
         uses: softprops/action-gh-release@v3
         with:
+          tag_name: ${{ steps.version.outputs.version }}
           files: |
             dist/*.tar.gz
             dist/*.zip
