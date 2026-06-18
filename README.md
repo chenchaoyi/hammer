@@ -4,16 +4,28 @@
 [![release](https://img.shields.io/github/v/release/chenchaoyi/hammer?logo=github&label=release)](https://github.com/chenchaoyi/hammer/releases/latest)
 [![license](https://img.shields.io/github/license/chenchaoyi/hammer)](LICENSE)
 
-Lightweight, single-binary HTTP(S) load generator written in Go.
+Lightweight, single-binary HTTP(S) load generator written in Go — built to be
+driven by humans **and AI agents** alike.
+
+**Why it's agent-friendly**
+
+- **Zero-config one-shot mode**: `hammer -url https://api/health -rps 50 -duration 10s` — no profile file to author first
+- **Machine-readable output**: `-output json` writes the full report to **stdout** (logs stay on stderr), so it pipes straight into `jq`
+- **SLO assertions + meaningful exit codes**: `-max-error-rate`, `-max-p95`, `-max-p99` turn a load test into a pass/fail check an agent can branch on (exit `1` = SLO violated)
+- **Reads a profile from stdin**: `… | hammer -profile -` — generate traffic mixes on the fly without temp files
+- **Quiet by default for automation**: `-quiet` silences the live monitor; the live HTTP `/stats` port is **opt-in** (no surprise port binds in CI/sandboxes)
+- **Self-describing**: `hammer -h` documents every flag, the exit codes, and copy-pasteable examples
+
+**Core engine**
 
 - **Constant-rate**: drives a configurable RPS using a tick loop
 - **Weighted traffic mix**: define multiple endpoints with relative weights in a JSON file
-- **Per-call headers**: set `Authorization`, API keys, tracing headers, … in the profile
+- **Per-call headers**: set `Authorization`, API keys, tracing headers, … per call
 - **URL / body templating**: `{{ uuid }}`, `{{ randInt 1000000 }}`, `{{ pickOne "us" "eu" }}` to avoid cache-hit skew
 - **Live monitor**: per-second `SendPS / ReceivePS / AvgRT / Pending / Err% / Slow%` log line
 - **Final report**: latency percentiles + per–status-code histogram + network-error categories
-- **Structured JSON report** on exit (`-json-out`) for CI / baseline diffing
-- **HTTP stats endpoint**: `GET /stats` while running
+- **Structured JSON report**: to stdout (`-output json`) or a file (`-json-out`) for CI / baseline diffing
+- **Optional HTTP stats endpoint**: `GET /stats` while running (`-stats-addr`)
 - **Graceful shutdown**: SIGINT/SIGTERM or `-duration`
 - **Per-request timeout**: stops slow servers from piling up goroutines
 
@@ -64,7 +76,13 @@ GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o hammer.linux .
 
 ## Quick start
 
-Hit `httpbin.org` for 10 seconds at 50 rps:
+Zero-config — hammer a single URL for 10 seconds at 50 rps (no profile file needed):
+
+```shell
+./hammer -url https://httpbin.org/get -rps 50 -duration 10s
+```
+
+Or drive a weighted traffic mix from a profile file:
 
 ```shell
 ./hammer -profile profiles/httpbin.json -rps 50 -duration 10s
@@ -73,8 +91,7 @@ Hit `httpbin.org` for 10 seconds at 50 rps:
 Expected output:
 
 ```
-2026/05/16 11:00:00 Stats endpoint: http://:9001/stats
-2026/05/16 11:00:00 Hammering @ 50 rps for 10s (timeout=30s, profile=profiles/httpbin.json)
+2026/05/16 11:00:00 Hammering @ 50 rps for 10s (timeout=30s, target=profiles/httpbin.json)
 2026/05/16 11:00:01  SendPS:   50  ReceivePS:   49  AvgRT: 0.1820s  Pending: 1  Err: 0|0.00%  Slow: 0.00%
 ...
 2026/05/16 11:00:10 Stopping...
@@ -88,7 +105,7 @@ Slow:     0  (> 1s)
 Status codes:
   200: 498
 
-Latency (ms):  min=140.12  p50=180.34  p90=220.55  p95=240.07  p99=310.82  max=410.43
+Latency (ms):  min=140.12  mean=182.04  p50=180.34  p90=220.55  p95=240.07  p99=310.82  max=410.43
 
 --- Per call ---
 API: GET https://httpbin.org/get
@@ -114,28 +131,109 @@ Network errors:
   conn: 1
 ```
 
+## For agents
+
+Hammer is designed so an autonomous agent can run a load test and act on the
+result with **no files and no scraping of human text**. The recommended recipe:
+
+```shell
+hammer -url https://api.example.com/health \
+       -rps 100 -duration 30s \
+       -output json -quiet \
+       -max-error-rate 0.01 -max-p99 500ms
+```
+
+- `-output json` prints the entire report to **stdout** as one JSON object; all
+  progress/diagnostic logging goes to **stderr**, so stdout is always clean to parse.
+- `-quiet` removes the per-second monitor noise.
+- `-max-*` flags assert SLOs. If any is violated the process exits non-zero, so
+  the agent can branch on the exit code alone — or read `.checks` in the JSON:
+
+```shell
+hammer -url https://api.example.com/ -duration 30s -output json -quiet \
+       -max-p99 500ms -max-error-rate 0.01 | jq '.checks'
+```
+
+```json
+{
+  "passed": false,
+  "results": [
+    { "name": "error_rate", "limit": 0.01, "actual": 0.0, "unit": "", "ok": true },
+    { "name": "p99_ms", "limit": 500, "actual": 612.3, "unit": "ms", "ok": false }
+  ]
+}
+```
+
+**Exit codes** (stable; safe to branch on):
+
+| Code | Meaning                                                        |
+|------|---------------------------------------------------------------|
+| `0`  | Run completed; all configured SLO checks passed (or none set) |
+| `1`  | Run completed but one or more SLO thresholds were violated    |
+| `2`  | Usage / argument error (bad flags, missing target, …)         |
+| `3`  | Setup error (couldn't load the profile, build the client, …)  |
+
+Without any `-max-*` flag, hammer never exits non-zero just because the target
+returned errors — it only fails on usage/setup problems. Opt into pass/fail with
+the SLO flags.
+
 ## Flags
+
+### Target (choose one)
 
 | Flag           | Default | Description                                                              |
 |----------------|---------|--------------------------------------------------------------------------|
-| `-profile`     | _(required)_ | Path to traffic profile JSON file                                   |
+| `-url`         | `""`    | Single target URL (zero-config mode). Templating works in the URL.        |
+| `-profile`     | `""`    | Path to a traffic profile JSON file, or `-` to read the profile from stdin |
+
+`-url` mode also accepts these (ignored in `-profile` mode):
+
+| Flag             | Default | Description                                                            |
+|------------------|---------|------------------------------------------------------------------------|
+| `-method`        | `GET`   | HTTP method for `-url` mode                                            |
+| `-body`          | `""`    | Request body for `-url` mode (templating supported)                   |
+| `-content-type`  | `""`    | Content-Type for `-url` mode: `REST`, `WWW`, or a raw value           |
+| `-header`        | _(none)_| Header as `'Key: Value'`; repeatable                                  |
+
+### Load & reporting
+
+| Flag           | Default | Description                                                              |
+|----------------|---------|--------------------------------------------------------------------------|
 | `-rps`         | `100`   | Target requests per second                                               |
 | `-duration`    | `0`     | Total run time (e.g. `30s`, `5m`); `0` runs until `Ctrl+C`               |
 | `-timeout`     | `30s`   | Per-request HTTP timeout                                                 |
 | `-slow`        | `1s`    | Log + count responses slower than this threshold                         |
+| `-output`      | `text`  | Final report format: `text` (human) or `json` (machine-readable, to stdout) |
+| `-quiet`       | `false` | Suppress the per-second progress monitor and info logs                   |
+| `-json-out`    | `""`    | Also write the structured JSON report to this file path                  |
+| `-ok`          | `""`    | Extra status codes treated as success (e.g. `-ok "404,409"`). 2xx and 3xx are always OK. |
+| `-stats-addr`  | `""`    | Address for the live `/stats` HTTP endpoint; empty (default) disables it  |
 | `-proxy`       | `""`    | HTTP proxy URL, e.g. `http://127.0.0.1:8888`                             |
 | `-insecure`    | `false` | Skip TLS certificate verification                                        |
 | `-debug`       | `false` | Verbose request/response logging (one log line per request)              |
-| `-stats-addr`  | `:9001` | Address for the `/stats` HTTP endpoint; empty string disables it         |
-| `-ok`          | `""`    | Extra status codes treated as success (e.g. `-ok "404,409"`). 2xx and 3xx are always OK. |
-| `-json-out`    | `""`    | Path to write a structured JSON report on exit; empty to skip               |
 | `-version`     | `false` | Print version (set via `-ldflags="-X main.version=..."`) and exit           |
+
+### SLO thresholds (drive the exit code)
+
+| Flag              | Default | Description                                                          |
+|-------------------|---------|----------------------------------------------------------------------|
+| `-max-error-rate` | `-1`    | Fail (exit `1`) if the error rate exceeds this fraction `[0,1]`; `-1` disables. `0` means "no errors allowed". |
+| `-max-p50`        | `0`     | Fail if p50 latency exceeds this duration (e.g. `100ms`); `0` disables |
+| `-max-p95`        | `0`     | Fail if p95 latency exceeds this duration; `0` disables               |
+| `-max-p99`        | `0`     | Fail if p99 latency exceeds this duration; `0` disables               |
 
 Run `./hammer -h` for the live list.
 
+> **Note:** the live `/stats` endpoint is now **off by default** (was `:9001`).
+> Enable it with `-stats-addr :9001` when you want it. This keeps automated runs
+> from binding a port they didn't ask for.
+
 ## Profile format
 
-A profile file is a **stream of JSON `Call` objects** (no enclosing array — just concatenate them, whitespace between objects is fine).
+For anything more than a single endpoint, use a profile. A profile is a **stream
+of JSON `Call` objects** (no enclosing array — just concatenate them, whitespace
+between objects is fine). Pass it with `-profile FILE`, or stream it on stdin
+with `-profile -`.
 
 ```json
 {
@@ -203,19 +301,27 @@ Templates are compiled once when the profile is loaded; if a field has no `{{` i
 
 ## Live monitoring
 
-While Hammer is running, hit the stats endpoint for a plain-text snapshot:
+The live `/stats` endpoint is **opt-in**. Start it by passing an address:
 
 ```shell
+./hammer -url https://httpbin.org/get -duration 1m -stats-addr :9001 &
 curl http://localhost:9001/stats
 ```
 
-Disable the endpoint with `-stats-addr ""` if port 9001 conflicts with your test target.
+It stays off by default so automated/CI runs never bind a port they didn't ask for.
 
 ## JSON report output
 
-Pass `-json-out report.json` to write a structured report on exit, suitable for CI assertions or baseline comparison across runs:
+Two independent ways to get the structured report:
+
+- `-output json` writes it to **stdout** (ideal for agents/pipelines; logs go to stderr)
+- `-json-out report.json` writes it to a file (handy for archiving a CI artifact)
 
 ```shell
+# stdout, straight into jq
+./hammer -url https://httpbin.org/get -rps 100 -duration 1m -output json -quiet | jq .
+
+# or to a file
 ./hammer -profile profiles/httpbin.json -rps 100 -duration 1m -json-out report.json
 ```
 
@@ -227,8 +333,10 @@ Shape:
   "end_time":   "2026-05-16T10:01:00Z",
   "duration_sec": 60.0,
   "target_rps": 100,
-  "profile": "profiles/httpbin.json",
+  "achieved_rps": 99.9,
+  "profile": "https://httpbin.org/get",
   "sent": 6000, "received": 5994, "errors": 6, "canceled": 0, "slow": 0,
+  "error_rate": 0.001,
   "slow_threshold_sec": 1,
   "status_codes":   [{"code": 200, "count": 5994}, {"code": 500, "count": 6}],
   "network_errors": [],
@@ -241,15 +349,33 @@ Shape:
   "per_call": [
     {"method": "GET",  "url": "https://httpbin.org/get",  "count": 4002, "avg_rt_sec": 0.183},
     {"method": "POST", "url": "https://httpbin.org/post", "count": 1992, "avg_rt_sec": 0.181}
-  ]
+  ],
+  "checks": {
+    "passed": true,
+    "results": [
+      {"name": "error_rate", "limit": 0.01, "actual": 0.001, "unit": "", "ok": true},
+      {"name": "p99_ms", "limit": 500, "actual": 310.82, "unit": "ms", "ok": true}
+    ]
+  }
 }
 ```
 
-In CI you can pipe this through `jq` to fail a build on regressions:
+`achieved_rps`, `error_rate`, and `checks` are computed for you so consumers don't
+have to. `checks` is present only when at least one `-max-*` flag is set.
+
+The cleanest way to gate CI/an agent on a regression is to let hammer do the
+asserting and check the exit code — no `jq` math required:
 
 ```shell
-./hammer -profile p.json -rps 200 -duration 30s -json-out r.json
-jq -e '.latency_ms.p99 < 500 and .errors == 0' r.json
+./hammer -url https://api.example.com/ -rps 200 -duration 30s \
+         -max-p99 500ms -max-error-rate 0 -quiet || echo "SLO breach!"
+```
+
+Prefer to assert yourself? Pipe the JSON through `jq`:
+
+```shell
+./hammer -url https://api.example.com/ -rps 200 -duration 30s -output json -quiet \
+  | jq -e '.latency_ms.p99 < 500 and .errors == 0'
 ```
 
 ## Behavior notes

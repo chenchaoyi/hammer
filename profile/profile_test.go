@@ -210,6 +210,73 @@ func TestCall_RenderExpandsTemplates(t *testing.T) {
 	}
 }
 
+func TestLoadFromReader_parsesStream(t *testing.T) {
+	src := strings.NewReader(`
+		{"Weight": 1, "Method": "get",  "URL": "http://example.com/a", "Body": ""}
+		{"Weight": 3, "Method": "post", "URL": "http://example.com/b", "Body": "x", "Type": "rest"}
+	`)
+	prof, err := LoadFromReader(src)
+	if err != nil {
+		t.Fatalf("LoadFromReader: %v", err)
+	}
+	if got, want := len(prof.calls), 2; got != want {
+		t.Fatalf("calls=%d, want %d", got, want)
+	}
+	if prof.calls[0].Method != "GET" {
+		t.Errorf("Method not upper-cased: %q", prof.calls[0].Method)
+	}
+	if prof.totalWeight != 4 {
+		t.Errorf("totalWeight=%v, want 4", prof.totalWeight)
+	}
+}
+
+func TestLoadFromReader_empty(t *testing.T) {
+	_, err := LoadFromReader(strings.NewReader(""))
+	if err == nil || !strings.Contains(err.Error(), "no calls") {
+		t.Fatalf("expected 'no calls' error, got %v", err)
+	}
+}
+
+func TestSingleCall_buildsOneCallProfileWithTemplating(t *testing.T) {
+	prof, err := SingleCall("post", "http://x/users/{{ randInt 1000 }}", `{"id":"{{ uuid }}"}`, "rest",
+		map[string]string{"Authorization": "Bearer t"})
+	if err != nil {
+		t.Fatalf("SingleCall: %v", err)
+	}
+	if len(prof.calls) != 1 {
+		t.Fatalf("calls=%d, want 1", len(prof.calls))
+	}
+	c := prof.calls[0]
+	if c.Method != "POST" {
+		t.Errorf("Method=%q, want POST (upper-cased)", c.Method)
+	}
+	if c.Type != "REST" {
+		t.Errorf("Type=%q, want REST (upper-cased)", c.Type)
+	}
+	if c.Headers["Authorization"] != "Bearer t" {
+		t.Errorf("Authorization header missing: %v", c.Headers)
+	}
+	if c.urlTmpl == nil || c.bodyTmpl == nil {
+		t.Fatal("templates should be compiled for {{ }} fields")
+	}
+	u, b, err := c.Render()
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	if strings.Contains(u, "{{") || strings.Contains(b, "{{") {
+		t.Errorf("templates not expanded: url=%q body=%q", u, b)
+	}
+	if !strings.HasPrefix(u, "http://x/users/") {
+		t.Errorf("unexpected URL: %q", u)
+	}
+}
+
+func TestSingleCall_rejectsBadTemplate(t *testing.T) {
+	if _, err := SingleCall("GET", "http://x/{{ unknownFunc }}", "", "", nil); err == nil {
+		t.Fatal("expected template parse error from SingleCall")
+	}
+}
+
 func TestCall_RenderTemplateParseError(t *testing.T) {
 	p := writeTempProfile(t, `{"Weight":1,"Method":"GET","URL":"http://x/{{ unknownFunc }}","Body":""}`)
 	if _, err := LoadFromFile(p); err == nil {

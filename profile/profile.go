@@ -100,38 +100,78 @@ func LoadFromFile(path string) (*Profile, error) {
 	}
 	defer f.Close()
 
+	p, err := LoadFromReader(f)
+	if err != nil {
+		return nil, fmt.Errorf("parse %s: %w", path, err)
+	}
+	return p, nil
+}
+
+// LoadFromReader parses a traffic profile from any reader containing a stream
+// of JSON-encoded Call objects. It lets callers feed a profile from stdin or
+// any other source without first materializing a file.
+func LoadFromReader(r io.Reader) (*Profile, error) {
 	p := &Profile{}
-	dec := json.NewDecoder(f)
+	dec := json.NewDecoder(r)
 	for {
 		c := &Call{}
 		if err := dec.Decode(c); err == io.EOF {
 			break
 		} else if err != nil {
-			return nil, fmt.Errorf("parse %s: %w", path, err)
+			return nil, err
 		}
-		c.Method = strings.ToUpper(c.Method)
-		c.Type = strings.ToUpper(c.Type)
-		if c.Weight <= 0 {
-			return nil, fmt.Errorf("call %s %s has non-positive weight", c.Method, c.URL)
+		if err := p.add(c); err != nil {
+			return nil, err
 		}
-		if t, err := compileTemplate("url", c.URL); err != nil {
-			return nil, fmt.Errorf("URL template for %s %s: %w", c.Method, c.URL, err)
-		} else {
-			c.urlTmpl = t
-		}
-		if t, err := compileTemplate("body", c.Body); err != nil {
-			return nil, fmt.Errorf("body template for %s %s: %w", c.Method, c.URL, err)
-		} else {
-			c.bodyTmpl = t
-		}
-		p.totalWeight += c.Weight
-		c.randomWeight = p.totalWeight
-		p.calls = append(p.calls, c)
 	}
 	if len(p.calls) == 0 {
-		return nil, fmt.Errorf("no calls found in %s", path)
+		return nil, fmt.Errorf("no calls found")
 	}
 	return p, nil
+}
+
+// SingleCall builds a one-call profile from explicit parameters, compiling
+// URL/body templates exactly like a file-loaded profile. It powers hammer's
+// zero-config mode, where an agent targets a single URL via flags instead of
+// authoring a profile file.
+func SingleCall(method, url, body, ctype string, headers map[string]string) (*Profile, error) {
+	p := &Profile{}
+	c := &Call{
+		Weight:  1,
+		Method:  method,
+		URL:     url,
+		Body:    body,
+		Type:    ctype,
+		Headers: headers,
+	}
+	if err := p.add(c); err != nil {
+		return nil, err
+	}
+	return p, nil
+}
+
+// add normalizes, validates, compiles templates for, and appends a single
+// Call, accumulating its weight. It is the shared core of every loader.
+func (p *Profile) add(c *Call) error {
+	c.Method = strings.ToUpper(c.Method)
+	c.Type = strings.ToUpper(c.Type)
+	if c.Weight <= 0 {
+		return fmt.Errorf("call %s %s has non-positive weight", c.Method, c.URL)
+	}
+	if t, err := compileTemplate("url", c.URL); err != nil {
+		return fmt.Errorf("URL template for %s %s: %w", c.Method, c.URL, err)
+	} else {
+		c.urlTmpl = t
+	}
+	if t, err := compileTemplate("body", c.Body); err != nil {
+		return fmt.Errorf("body template for %s %s: %w", c.Method, c.URL, err)
+	} else {
+		c.bodyTmpl = t
+	}
+	p.totalWeight += c.Weight
+	c.randomWeight = p.totalWeight
+	p.calls = append(p.calls, c)
+	return nil
 }
 
 // NextCall picks a call according to its weight.
