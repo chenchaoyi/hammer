@@ -70,22 +70,30 @@ jobs:
         run: |
           set -euo pipefail
           cd dist
+          cp ../install.sh install.sh
+          chmod 0755 install.sh
           for bin in hammer-*; do
             case "$bin" in
               *.exe)
                 base="${bin%.exe}"
-                zip "${base}.zip" "$bin"
+                mkdir -p package
+                cp "$bin" package/hammer.exe
+                (cd package && zip "../${base}.zip" hammer.exe)
+                rm -rf package
                 ;;
               *.zip|*.tar.gz|SHA256SUMS)
                 continue
                 ;;
               *)
-                tar -czf "${bin}.tar.gz" "$bin"
+                mkdir -p package
+                cp "$bin" package/hammer
+                tar -czf "${bin}.tar.gz" -C package hammer
+                rm -rf package
                 ;;
             esac
           done
           rm -f hammer-*-amd64 hammer-*-arm64 hammer-*.exe
-          sha256sum *.tar.gz *.zip > SHA256SUMS
+          sha256sum *.tar.gz *.zip install.sh > SHA256SUMS
           ls -lh
 
       - name: Create release
@@ -95,6 +103,7 @@ jobs:
           files: |
             dist/*.tar.gz
             dist/*.zip
+            dist/install.sh
             dist/SHA256SUMS
           generate_release_notes: true
           fail_on_unmatched_files: true

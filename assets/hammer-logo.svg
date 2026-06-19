@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 104" shape-rendering="crispEdges" role="img" aria-label="hammer — HTTP load generator">
+  <g transform="translate(6 9) scale(0.84)" fill="#fea62b">
+    <rect x="8" y="8" width="8" height="8"></rect>
+    <rect x="24" y="8" width="8" height="8"></rect>
+    <rect x="8" y="16" width="72" height="8"></rect>
+    <rect x="8" y="24" width="72" height="8"></rect>
+    <rect x="64" y="32" width="16" height="8"></rect>
+    <rect x="48" y="32" width="8" height="56"></rect>
+    <rect x="8" y="90" width="72" height="3"></rect>
+  </g>
+  <text x="116" y="60" font-family="&#39;Fira Code&#39;,&#39;JetBrains Mono&#39;,&#39;SF Mono&#39;,Menlo,monospace" font-weight="700" font-size="52" letter-spacing="-2.4" fill="#e0e0e0">hammer</text>
+  <text x="118" y="86" font-family="&#39;Fira Code&#39;,&#39;JetBrains Mono&#39;,&#39;SF Mono&#39;,Menlo,monospace" font-weight="500" font-size="13" letter-spacing="5.5" fill="#fea62b">HTTP LOAD GENERATOR</text>
+</svg>

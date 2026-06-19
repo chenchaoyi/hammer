@@ -1,13 +1,17 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -55,6 +59,203 @@ func newTestCounter(t *testing.T, prof *profile.Profile, timeout, slow time.Dura
 		t.Fatalf("newCounter: %v", err)
 	}
 	return c
+}
+
+func withColorState(t *testing.T, out, err bool) {
+	t.Helper()
+	prevOut, prevErr := colorOut, colorErr
+	colorOut, colorErr = out, err
+	t.Cleanup(func() {
+		colorOut, colorErr = prevOut, prevErr
+	})
+}
+
+var ansiRE = regexp.MustCompile(`\x1b\[[0-9;]*m`)
+
+func stripANSI(s string) string {
+	return ansiRE.ReplaceAllString(s, "")
+}
+
+func populatedReportCounter(t *testing.T) *Counter {
+	t.Helper()
+	prof, err := profile.SingleCall("GET", "https://example.test/ok", "", "", nil)
+	if err != nil {
+		t.Fatalf("profile: %v", err)
+	}
+	prof.Calls()[0].Record(int64(25 * time.Millisecond))
+	prof.Calls()[0].Record(int64(35 * time.Millisecond))
+
+	c := newTestCounter(t, prof, time.Second, time.Second)
+	c.sentCount.Store(5)
+	c.recvCount.Store(3)
+	c.errCount.Store(2)
+	c.canceledCount.Store(1)
+	c.slowCount.Store(1)
+	c.statusCounts[200].Store(3)
+	c.statusCounts[404].Store(1)
+	c.statusCounts[500].Store(1)
+	c.netErrCounts[netErrTimeout].Store(1)
+	c.latMs = []float64{10, 20, 30}
+	return c
+}
+
+func TestREADMEHeroLogoAtTop(t *testing.T) {
+	data, err := os.ReadFile("README.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `<p align="center">
+  <img src="assets/hammer-logo.svg" alt="hammer — HTTP load generator" height="88">
+</p>
+`
+	if !strings.HasPrefix(string(data), want) {
+		t.Fatalf("README.md does not start with logo hero:\n%s", string(data[:min(len(data), 120)]))
+	}
+}
+
+func TestColorHelpersRespectPlainMode(t *testing.T) {
+	if got := paint(false, "plain", cRed, cBold); got != "plain" {
+		t.Fatalf("paint disabled = %q, want plain", got)
+	}
+	if got := paint(true, "hot", cRed, cBold); got != cRed+cBold+"hot"+cReset {
+		t.Fatalf("paint enabled = %q", got)
+	}
+	t.Setenv("NO_COLOR", "1")
+	if colorEnabled(os.Stdout) {
+		t.Fatal("NO_COLOR should disable stdout color")
+	}
+}
+
+func TestReportPlainModeMatchesExistingBytes(t *testing.T) {
+	withColorState(t, false, false)
+	c := populatedReportCounter(t)
+	checks := &ChecksReport{
+		Passed: false,
+		Results: []CheckResult{
+			{Name: "error_rate", Actual: 0.02, Limit: 0.01, Unit: "ratio", OK: false},
+			{Name: "p99_ms", Actual: 150, Limit: 500, Unit: "ms", OK: true},
+		},
+	}
+
+	var buf bytes.Buffer
+	c.report(&buf, checks)
+
+	want := `
+=== Summary ===
+Sent:     5
+Received: 3
+Errors:   2
+Canceled: 1  (in-flight at shutdown)
+Slow:     1  (> 1s)
+
+Status codes:
+  200: 3
+  404: 1
+  500: 1
+
+Network errors:
+  timeout: 1
+
+Latency (ms):  min=10.00  mean=20.00  p50=20.00  p90=20.00  p95=20.00  p99=20.00  max=30.00
+
+--- Per call ---
+API: GET https://example.test/ok
+Total Call: 2
+Avg RT: 0.0300s
++++++++
+
+=== Checks ===
+  error_rate   0.02 > 0.01 ratio  FAIL
+  p99_ms       150 <= 500 ms  PASS
+RESULT: FAIL
+`
+	if got := buf.String(); got != want {
+		t.Fatalf("plain report changed:\n--- got ---\n%s\n--- want ---\n%s", got, want)
+	}
+}
+
+func TestReportColorModeWrapsOnlyDecorations(t *testing.T) {
+	withColorState(t, true, false)
+	c := populatedReportCounter(t)
+	checks := &ChecksReport{
+		Passed: false,
+		Results: []CheckResult{
+			{Name: "error_rate", Actual: 0.02, Limit: 0.01, Unit: "ratio", OK: false},
+			{Name: "p99_ms", Actual: 150, Limit: 500, Unit: "ms", OK: true},
+		},
+	}
+
+	var buf bytes.Buffer
+	c.report(&buf, checks)
+	got := buf.String()
+	if !strings.Contains(got, cOrange+cBold+"=== Summary ==="+cReset) {
+		t.Fatalf("summary header not colorized as expected:\n%q", got)
+	}
+	for _, want := range []string{
+		cGreen + "200" + cReset,
+		cYellow + "404" + cReset,
+		cRed + "500" + cReset,
+		cRed + "timeout: 1" + cReset,
+		cRed + "FAIL" + cReset,
+		cGreen + "PASS" + cReset,
+		"RESULT: " + cRed + cBold + "FAIL" + cReset,
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("color report missing %q:\n%s", want, got)
+		}
+	}
+	plain := stripANSI(got)
+	if strings.Contains(plain, "\x1b[") {
+		t.Fatalf("stripANSI left escapes in:\n%q", got)
+	}
+}
+
+func TestTickPlainAndColorOutput(t *testing.T) {
+	prof, err := profile.SingleCall("GET", "https://example.test/ok", "", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := newTestCounter(t, prof, time.Second, time.Second)
+	c.sentCount.Store(12)
+	c.recvCount.Store(10)
+	c.errCount.Store(1)
+	c.slowCount.Store(2)
+	c.totalTimeNs.Store(int64(1500 * time.Millisecond))
+
+	var plain bytes.Buffer
+	logOutput := logWriter(t, &plain)
+	withColorState(t, false, false)
+	c.tick()
+	logOutput()
+	want := " SendPS:   12  ReceivePS:   10  AvgRT: 0.1500s  Pending: 1  Err: 1|9.09%  Slow: 18.18%\n"
+	if plain.String() != want {
+		t.Fatalf("plain tick = %q, want %q", plain.String(), want)
+	}
+
+	c.lastSent, c.lastRecv = 0, 0
+	var colored bytes.Buffer
+	logOutput = logWriter(t, &colored)
+	withColorState(t, false, true)
+	c.tick()
+	logOutput()
+	if stripANSI(colored.String()) != want {
+		t.Fatalf("color tick plain bytes changed:\n%q\nwant:\n%q", stripANSI(colored.String()), want)
+	}
+	if !strings.Contains(colored.String(), cRed+"1|9.09%"+cReset) {
+		t.Fatalf("color tick did not color error value red:\n%q", colored.String())
+	}
+}
+
+func logWriter(t *testing.T, w io.Writer) func() {
+	t.Helper()
+	prevOut := log.Writer()
+	prevFlags := log.Flags()
+	log.SetOutput(w)
+	log.SetFlags(0)
+	return func() {
+		log.SetOutput(prevOut)
+		log.SetFlags(prevFlags)
+	}
 }
 
 func TestHammer_successCountsAndRecordsLatency(t *testing.T) {

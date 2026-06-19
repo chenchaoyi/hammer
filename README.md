@@ -1,4 +1,6 @@
-# Hammer
+<p align="center">
+  <img src="assets/hammer-logo.svg" alt="hammer — HTTP load generator" height="88">
+</p>
 
 [![ci](https://github.com/chenchaoyi/hammer/actions/workflows/ci.yml/badge.svg)](https://github.com/chenchaoyi/hammer/actions/workflows/ci.yml)
 [![release](https://img.shields.io/github/v/release/chenchaoyi/hammer?logo=github&label=release)](https://github.com/chenchaoyi/hammer/releases/latest)
@@ -25,24 +27,63 @@ driven by humans **and AI agents** alike.
 - **Live monitor**: per-second `SendPS / ReceivePS / AvgRT / Pending / Err% / Slow%` log line
 - **Final report**: latency percentiles + per–status-code histogram + network-error categories
 - **Structured JSON report**: to stdout (`-output json`) or a file (`-json-out`) for CI / baseline diffing
+- **TTY-aware color**: ANSI color in interactive terminals; byte-stable plain text for pipes, redirects, JSON, CI, and tests
 - **Optional HTTP stats endpoint**: `GET /stats` while running (`-stats-addr`)
 - **Graceful shutdown**: SIGINT/SIGTERM or `-duration`
 - **Per-request timeout**: stops slow servers from piling up goroutines
 
 ## Install
 
-### Prebuilt binary (recommended)
+### Install script (recommended)
+
+Install the latest GitHub release as a `hammer` command:
+
+```shell
+curl -fsSL https://github.com/chenchaoyi/hammer/releases/latest/download/install.sh | sh
+hammer -version
+```
+
+The installer detects macOS/Linux and `amd64`/`arm64`, verifies the downloaded
+archive against `SHA256SUMS`, and installs to `/usr/local/bin` when writable
+or `$HOME/.local/bin` otherwise. To choose a directory:
+
+```shell
+curl -fsSL https://github.com/chenchaoyi/hammer/releases/latest/download/install.sh | HAMMER_INSTALL_DIR="$HOME/bin" sh
+```
+
+If GitHub release downloads are unstable from your network, force the mirror
+ladder and skip the direct GitHub attempt:
+
+```shell
+curl -fsSL https://github.com/chenchaoyi/hammer/releases/latest/download/install.sh | HAMMER_INSTALL_MIRROR=ghproxy sh
+```
+
+`HAMMER_INSTALL_MIRROR` accepts `auto` (default: GitHub first, then mirrors),
+`github` (canonical GitHub only), `ghproxy` (mirror chain only), or a custom
+`https://proxy.example/` prefix that serves `<proxy><github-url>`.
+Each download attempt has a bounded timeout, and the installer rejects invalid
+mirror responses by checking that archives are gzip streams and `SHA256SUMS`
+contains the expected 64-hex entry before installing anything.
+
+If downloading `install.sh` itself is blocked, bootstrap through the same mirror
+style first:
+
+```shell
+curl -fsSL https://ghfast.top/https://github.com/chenchaoyi/hammer/releases/latest/download/install.sh | HAMMER_INSTALL_MIRROR=ghproxy sh
+```
+
+### Manual archive download
 
 Grab the archive for your platform from the [latest GitHub release](https://github.com/chenchaoyi/hammer/releases/latest):
 
 ```shell
 # macOS (Apple Silicon)
 curl -L https://github.com/chenchaoyi/hammer/releases/latest/download/hammer-darwin-arm64.tar.gz | tar xz
-./hammer-darwin-arm64 -version
+./hammer -version
 
 # Linux x86_64
 curl -L https://github.com/chenchaoyi/hammer/releases/latest/download/hammer-linux-amd64.tar.gz | tar xz
-./hammer-linux-amd64 -version
+./hammer -version
 ```
 
 Binaries are statically linked (no libc dependency), ~7-8 MB, available for:
@@ -381,6 +422,7 @@ Prefer to assert yourself? Pipe the JSON through `jq`:
 ## Behavior notes
 
 - **Success vs. error**: 2xx and 3xx responses are successes. Anything else (including 4xx, 5xx, and network failures) is an error. Use `-ok "404,409"` to whitelist additional status codes as success.
+- **Terminal color**: live progress and text reports use ANSI color only when the relevant stream is an interactive TTY. `NO_COLOR`, `TERM=dumb`, pipes, redirects, `-output json`, and captured test output stay plain.
 - **Network-error categories** reported in the summary:
   - `timeout` – the per-request `-timeout` exceeded
   - `canceled` – request was in-flight when the run ended (Ctrl+C or `-duration`); not counted in `Errors`
@@ -420,14 +462,21 @@ git tag -a v1.0.0 -m "v1.0.0"
 git push origin v1.0.0
 ```
 
-The workflow runs the test suite first, then builds for `linux/{amd64,arm64}`, `darwin/{amd64,arm64}`, and `windows/amd64`, packages each into a `.tar.gz` (or `.zip` for Windows), generates a `SHA256SUMS` file, and attaches everything to the release with auto-generated notes.
+The workflow runs the test suite first, then builds for `linux/{amd64,arm64}`,
+`darwin/{amd64,arm64}`, and `windows/amd64`. Unix archives contain a binary
+named `hammer`; the Windows zip contains `hammer.exe`. The release also includes
+`install.sh` and `SHA256SUMS`, so the one-line curl installer works from the
+GitHub release page without reading files from the branch tip.
 
 ## Layout
 
 ```
 hammer.go              # CLI + load generator
+color.go               # TTY-gated ANSI color helpers
+install.sh             # GitHub release installer with mirror fallback
 profile/               # traffic-profile parser
 profiles/              # example profile files
+assets/                # README logo and brand assets
 cmd/testserver/        # tiny local HTTP target for development
 ```
 

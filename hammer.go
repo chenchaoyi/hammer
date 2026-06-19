@@ -264,10 +264,26 @@ func (c *Counter) tick() {
 		denom = 1
 	}
 
-	log.Printf(" SendPS: %4d  ReceivePS: %4d  AvgRT: %.4fs  Pending: %d  Err: %d|%.2f%%  Slow: %.2f%%",
-		sps, pps, avg, backlog, errs,
-		float64(errs)*100/float64(denom),
-		float64(slow)*100/float64(denom))
+	errPct := float64(errs) * 100 / float64(denom)
+	errStr := fmt.Sprintf("%d|%.2f%%", errs, errPct)
+	errCol := cDim
+	if errs > 0 {
+		errCol = cRed
+	}
+	slowPct := float64(slow) * 100 / float64(denom)
+	slowStr := fmt.Sprintf("%.2f%%", slowPct)
+	slowCol := cDim
+	if slowPct > 0 {
+		slowCol = cYellow
+	}
+
+	log.Printf(" %s %s  %s %s  %s %s  %s %s  %s %s  %s %s",
+		pe("SendPS:", cDim), pe(fmt.Sprintf("%4d", sps), cFg, cBold),
+		pe("ReceivePS:", cDim), pe(fmt.Sprintf("%4d", pps), cFg, cBold),
+		pe("AvgRT:", cDim), pe(fmt.Sprintf("%.4fs", avg), cCyan, cBold),
+		pe("Pending:", cDim), pe(fmt.Sprintf("%d", backlog), cFg),
+		pe("Err:", cDim), pe(errStr, errCol),
+		pe("Slow:", cDim), pe(slowStr, slowCol))
 }
 
 // percentile returns the q-th percentile (q in [0, 1]) from an already-sorted
@@ -287,26 +303,64 @@ func percentile(sorted []float64, q float64) float64 {
 }
 
 func (c *Counter) statusBreakdown() string {
+	return c.statusBreakdownWith(po)
+}
+
+func (c *Counter) statusBreakdownPlain() string {
+	return c.statusBreakdownWith(noColor)
+}
+
+type colorFunc func(string, ...string) string
+
+func noColor(s string, _ ...string) string { return s }
+
+func statusColor(sc int) string {
+	switch {
+	case sc >= 200 && sc < 300:
+		return cGreen
+	case sc >= 300 && sc < 400:
+		return cCyan
+	case sc >= 400 && sc < 500:
+		return cYellow
+	case sc >= 500:
+		return cRed
+	default:
+		return cDim
+	}
+}
+
+func (c *Counter) statusBreakdownWith(colorize colorFunc) string {
 	var b strings.Builder
 	any := false
 	for sc := 100; sc < len(c.statusCounts); sc++ {
 		if n := c.statusCounts[sc].Load(); n > 0 {
-			fmt.Fprintf(&b, "  %d: %d\n", sc, n)
+			fmt.Fprintf(&b, "  %s: %s\n",
+				colorize(strconv.Itoa(sc), statusColor(sc)),
+				colorize(strconv.FormatInt(n, 10), cFg))
 			any = true
 		}
 	}
 	if !any {
-		b.WriteString("  (none)\n")
+		fmt.Fprintf(&b, "  %s\n", colorize("(none)", cDim))
 	}
 	return b.String()
 }
 
 func (c *Counter) netErrBreakdown() string {
+	return c.netErrBreakdownWith(po)
+}
+
+func (c *Counter) netErrBreakdownPlain() string {
+	return c.netErrBreakdownWith(noColor)
+}
+
+func (c *Counter) netErrBreakdownWith(colorize colorFunc) string {
 	var b strings.Builder
 	any := false
 	for cat := netErrCanceled; cat < netErrCategory(len(c.netErrCounts)); cat++ {
 		if n := c.netErrCounts[cat].Load(); n > 0 {
-			fmt.Fprintf(&b, "  %s: %d\n", netErrCategoryNames[cat], n)
+			fmt.Fprintf(&b, "  %s\n",
+				colorize(fmt.Sprintf("%s: %d", netErrCategoryNames[cat], n), cRed))
 			any = true
 		}
 	}
@@ -325,22 +379,34 @@ func (c *Counter) report(w io.Writer, checks *ChecksReport) {
 	sort.Float64s(samples)
 
 	fmt.Fprintln(w)
-	fmt.Fprintln(w, "=== Summary ===")
-	fmt.Fprintf(w, "Sent:     %d\n", c.sentCount.Load())
-	fmt.Fprintf(w, "Received: %d\n", c.recvCount.Load())
-	fmt.Fprintf(w, "Errors:   %d\n", c.errCount.Load())
-	if canceled := c.canceledCount.Load(); canceled > 0 {
-		fmt.Fprintf(w, "Canceled: %d  (in-flight at shutdown)\n", canceled)
+	fmt.Fprintln(w, po("=== Summary ===", cOrange, cBold))
+	fmt.Fprintf(w, "%s     %s\n", po("Sent:", cDim), po(strconv.FormatInt(c.sentCount.Load(), 10), cFg))
+	fmt.Fprintf(w, "%s %s\n", po("Received:", cDim), po(strconv.FormatInt(c.recvCount.Load(), 10), cFg))
+	errs := c.errCount.Load()
+	errColor := cGreen
+	if errs > 0 {
+		errColor = cRed
 	}
-	fmt.Fprintf(w, "Slow:     %d  (> %s)\n", c.slowCount.Load(), c.slowThreshold)
+	fmt.Fprintf(w, "%s   %s\n", po("Errors:", cDim), po(strconv.FormatInt(errs, 10), errColor))
+	if canceled := c.canceledCount.Load(); canceled > 0 {
+		fmt.Fprintf(w, "%s %s  (in-flight at shutdown)\n",
+			po("Canceled:", cDim), po(strconv.FormatInt(canceled, 10), cFg))
+	}
+	slow := c.slowCount.Load()
+	slowColor := cGreen
+	if slow > 0 {
+		slowColor = cYellow
+	}
+	fmt.Fprintf(w, "%s     %s  (> %s)\n",
+		po("Slow:", cDim), po(strconv.FormatInt(slow, 10), slowColor), c.slowThreshold)
 
 	fmt.Fprintln(w)
-	fmt.Fprintln(w, "Status codes:")
+	fmt.Fprintln(w, po("Status codes:", cYelHi, cBold))
 	fmt.Fprint(w, c.statusBreakdown())
 
 	if netErrs := c.netErrBreakdown(); netErrs != "" {
 		fmt.Fprintln(w)
-		fmt.Fprintln(w, "Network errors:")
+		fmt.Fprintln(w, po("Network errors:", cYelHi, cBold))
 		fmt.Fprint(w, netErrs)
 	}
 
@@ -356,17 +422,18 @@ func (c *Counter) report(w io.Writer, checks *ChecksReport) {
 	}
 	mean := sum / float64(len(samples))
 	fmt.Fprintln(w)
-	fmt.Fprintf(w, "Latency (ms):  min=%.2f  mean=%.2f  p50=%.2f  p90=%.2f  p95=%.2f  p99=%.2f  max=%.2f\n",
-		samples[0],
-		mean,
-		percentile(samples, 0.50),
-		percentile(samples, 0.90),
-		percentile(samples, 0.95),
-		percentile(samples, 0.99),
-		samples[len(samples)-1])
+	fmt.Fprintf(w, "%s  min=%s  mean=%s  p50=%s  p90=%s  p95=%s  p99=%s  max=%s\n",
+		po("Latency (ms):", cCyan),
+		po(fmt.Sprintf("%.2f", samples[0]), cFg, cBold),
+		po(fmt.Sprintf("%.2f", mean), cFg, cBold),
+		po(fmt.Sprintf("%.2f", percentile(samples, 0.50)), cFg, cBold),
+		po(fmt.Sprintf("%.2f", percentile(samples, 0.90)), cFg, cBold),
+		po(fmt.Sprintf("%.2f", percentile(samples, 0.95)), cFg, cBold),
+		po(fmt.Sprintf("%.2f", percentile(samples, 0.99)), cFg, cBold),
+		po(fmt.Sprintf("%.2f", samples[len(samples)-1]), cFg, cBold))
 
 	fmt.Fprintln(w)
-	fmt.Fprintln(w, "--- Per call ---")
+	fmt.Fprintln(w, po("--- Per call ---", cDim))
 	fmt.Fprint(w, c.profile.Print())
 
 	printChecks(w, checks)
@@ -378,21 +445,26 @@ func printChecks(w io.Writer, checks *ChecksReport) {
 		return
 	}
 	fmt.Fprintln(w)
-	fmt.Fprintln(w, "=== Checks ===")
+	fmt.Fprintln(w, po("=== Checks ===", cOrange, cBold))
 	for _, r := range checks.Results {
 		status := "PASS"
+		statusColor := cGreen
 		cmp := "<="
 		if !r.OK {
 			status = "FAIL"
+			statusColor = cRed
 			cmp = ">"
 		}
-		fmt.Fprintf(w, "  %-12s %.4g %s %.4g %s  %s\n", r.Name, r.Actual, cmp, r.Limit, r.Unit, status)
+		fmt.Fprintf(w, "  %-12s %.4g %s %.4g %s  %s\n",
+			r.Name, r.Actual, cmp, r.Limit, r.Unit, po(status, statusColor))
 	}
 	verdict := "PASS"
+	verdictColor := cGreen
 	if !checks.Passed {
 		verdict = "FAIL"
+		verdictColor = cRed
 	}
-	fmt.Fprintf(w, "RESULT: %s\n", verdict)
+	fmt.Fprintf(w, "RESULT: %s\n", po(verdict, verdictColor, cBold))
 }
 
 // --- JSON report --------------------------------------------------------
@@ -781,6 +853,9 @@ func run() int {
 		return exitUsage
 	}
 
+	colorErr = colorEnabled(os.Stderr)
+	colorOut = colorEnabled(os.Stdout) && output != "json"
+
 	extraOK, err := parseExtraOKCodes(extraOKList)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: parse -ok: %v\n", err)
@@ -837,8 +912,8 @@ func run() int {
 			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 			fmt.Fprintf(w, "Sent: %d\nReceived: %d\nErrors: %d\nCanceled: %d\n",
 				c.sentCount.Load(), c.recvCount.Load(), c.errCount.Load(), c.canceledCount.Load())
-			fmt.Fprintf(w, "\nStatus codes:\n%s", c.statusBreakdown())
-			if netErrs := c.netErrBreakdown(); netErrs != "" {
+			fmt.Fprintf(w, "\nStatus codes:\n%s", c.statusBreakdownPlain())
+			if netErrs := c.netErrBreakdownPlain(); netErrs != "" {
 				fmt.Fprintf(w, "\nNetwork errors:\n%s", netErrs)
 			}
 			fmt.Fprintf(w, "\n==========\n%s", prof.Print())
@@ -870,7 +945,11 @@ func run() int {
 		durLabel = "for " + duration.String()
 	}
 	if !quiet {
-		log.Printf("Hammering @ %d rps %s (timeout=%s, target=%s)", rps, durLabel, timeout, profileLabel)
+		log.Printf("Hammering @ %s %s (timeout=%s, target=%s)",
+			pe(fmt.Sprintf("%d rps", rps), cOrange, cBold),
+			durLabel,
+			pe(timeout.String(), cDim),
+			pe(profileLabel, cDim))
 	}
 	startTime := time.Now()
 
@@ -890,7 +969,7 @@ LOOP:
 	endTime := time.Now()
 
 	if !quiet {
-		log.Println("Stopping...")
+		log.Println(pe("Stopping...", cDim))
 	}
 
 	// Build the report once; render it as text or JSON, and reuse it for
