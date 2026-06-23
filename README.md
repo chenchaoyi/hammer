@@ -115,6 +115,24 @@ Cross-compile, e.g. for Linux:
 GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o hammer.linux .
 ```
 
+### Updating
+
+Once installed, hammer can update itself in place:
+
+```shell
+hammer update            # download the latest release and replace this binary
+hammer update -check     # only report whether a newer version is available
+hammer update -version v1.2.0   # install a specific release
+hammer update -y         # skip the confirmation prompt (for scripts/CI)
+```
+
+`update` resolves the target release from the GitHub API, downloads the archive
+for your platform, verifies it against `SHA256SUMS`, and atomically swaps the
+running binary. It honors the same mirror controls as the installer — pass
+`-mirror ghproxy` (or set `HAMMER_INSTALL_MIRROR`) when GitHub is unreachable,
+and `HAMMER_REPO` to update from a fork. If the binary lives in a directory you
+can't write to (e.g. `/usr/local/bin`), re-run with `sudo`.
+
 ## Quick start
 
 Zero-config — hammer a single URL for 10 seconds at 50 rps (no profile file needed):

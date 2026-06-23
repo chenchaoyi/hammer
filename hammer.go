@@ -747,6 +747,7 @@ Usage:
   hammer -url URL [options]                 # zero-config: hammer a single URL
   hammer -profile FILE [options]            # weighted traffic mix from a file
   hammer -profile - [options]               # read the profile from stdin
+  hammer update [options]                    # self-update to the latest release
 
 Agent-friendly options:
   -output json    emit the structured report to stdout (logs stay on stderr)
@@ -768,7 +769,12 @@ Options:
 	flag.PrintDefaults()
 }
 
-func main() { os.Exit(run()) }
+func main() {
+	if len(os.Args) > 1 && os.Args[1] == "update" {
+		os.Exit(runUpdate(os.Args[2:]))
+	}
+	os.Exit(run())
+}
 
 func run() int {
 	var (
