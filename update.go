@@ -25,6 +25,14 @@ import (
 // be overridden with HAMMER_REPO so forks can self-update too.
 const defaultUpdateRepo = "chenchaoyi/hammer"
 
+// apiBaseURL and downloadBaseURL are the GitHub endpoints the updater talks to.
+// They are package vars (not consts) only so tests can redirect them at a local
+// httptest server; production always uses the real GitHub hosts.
+var (
+	apiBaseURL      = "https://api.github.com"
+	downloadBaseURL = "https://github.com"
+)
+
 // mirrorProxies mirrors install.sh: when GitHub is unreachable (common in
 // mainland China), each proxy is prepended to the GitHub URL as a fallback.
 var mirrorProxies = []string{
@@ -156,7 +164,7 @@ func runUpdate(args []string) int {
 
 	// --- Download the archive + checksums ------------------------------
 	assetName, isZip := assetNameFor(runtime.GOOS, runtime.GOARCH)
-	base := fmt.Sprintf("https://github.com/%s/releases/download/%s", repo, latest)
+	base := fmt.Sprintf("%s/%s/releases/download/%s", downloadBaseURL, repo, latest)
 
 	fmt.Fprintf(os.Stderr, "Downloading %s\n", po(assetName, cCyan))
 	archive, err := downloadWithFallback(ctx, client, base+"/"+assetName, opt.mirrorMode)
@@ -206,12 +214,12 @@ type ghRelease struct {
 }
 
 func fetchLatestRelease(ctx context.Context, client *http.Client, repo string) (*ghRelease, error) {
-	url := fmt.Sprintf("https://api.github.com/repos/%s/releases/latest", repo)
+	url := fmt.Sprintf("%s/repos/%s/releases/latest", apiBaseURL, repo)
 	return getRelease(ctx, client, url)
 }
 
 func fetchReleaseByTag(ctx context.Context, client *http.Client, repo, tag string) (*ghRelease, error) {
-	url := fmt.Sprintf("https://api.github.com/repos/%s/releases/tags/%s", repo, tag)
+	url := fmt.Sprintf("%s/repos/%s/releases/tags/%s", apiBaseURL, repo, tag)
 	return getRelease(ctx, client, url)
 }
 
