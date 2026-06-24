@@ -289,29 +289,41 @@ Run `./hammer -h` for the live list.
 
 ## Profile format
 
-For anything more than a single endpoint, use a profile. A profile is a **stream
-of JSON `Call` objects** (no enclosing array — just concatenate them, whitespace
-between objects is fine). Pass it with `-profile FILE`, or stream it on stdin
-with `-profile -`.
+For anything more than a single endpoint, use a profile: a list of weighted
+`Call` objects. Pass it with `-profile FILE`, or stream it on stdin with
+`-profile -`. JSON field names are case-insensitive, so `"weight"` and
+`"Weight"` are equivalent.
+
+The natural form is a **JSON array**:
 
 ```json
-{
-  "Weight": 40,
-  "Method": "GET",
-  "URL": "https://httpbin.org/get",
-  "Body": "",
-  "Headers": {
-    "Authorization": "Bearer your-token",
-    "X-Trace-Id": "hammer-load-test"
+[
+  {
+    "Weight": 40,
+    "Method": "GET",
+    "URL": "https://httpbin.org/get",
+    "Headers": {
+      "Authorization": "Bearer your-token",
+      "X-Trace-Id": "hammer-load-test"
+    }
+  },
+  {
+    "Weight": 20,
+    "Method": "POST",
+    "URL": "https://httpbin.org/post",
+    "Body": "{\"test\":\"hammer\"}",
+    "Type": "REST"
   }
-}
-{
-  "Weight": 20,
-  "Method": "POST",
-  "URL": "https://httpbin.org/post",
-  "Body": "{\"test\":\"hammer\"}",
-  "Type": "REST"
-}
+]
+```
+
+A bare **stream of objects** (concatenated, no enclosing array — whitespace
+between them optional) is also accepted, which is handy for appending calls
+to a file or generating them line by line:
+
+```json
+{"Weight": 40, "Method": "GET",  "URL": "https://httpbin.org/get"}
+{"Weight": 20, "Method": "POST", "URL": "https://httpbin.org/post", "Body": "{\"test\":\"hammer\"}", "Type": "REST"}
 ```
 
 | Field     | Required | Description                                                                |
