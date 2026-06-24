@@ -169,19 +169,36 @@ func TestInstallDocsUseReleaseCurlOneLiner(t *testing.T) {
 	}
 }
 
+// Releases are cut by GoReleaser; the curl one-liner depends on install.sh
+// being attached to every release. GoReleaser does that via release.extra_files
+// in .goreleaser.yaml, so assert the installer is wired in there.
 func TestReleaseWorkflowPublishesInstaller(t *testing.T) {
-	data, err := os.ReadFile(".github/workflows/release.yml")
+	data, err := os.ReadFile(".goreleaser.yaml")
 	if err != nil {
 		t.Fatal(err)
 	}
 	text := string(data)
+	if !strings.Contains(text, "./install.sh") {
+		t.Fatal(".goreleaser.yaml does not publish install.sh (release.extra_files)")
+	}
+	// The archive/checksum names must stay stable so install.sh and
+	// `hammer update` keep resolving them.
 	for _, want := range []string{
-		"cp ../install.sh install.sh",
-		"dist/install.sh",
+		`name_template: "hammer-{{ .Os }}-{{ .Arch }}"`,
+		`name_template: "SHA256SUMS"`,
 	} {
 		if !strings.Contains(text, want) {
-			t.Fatalf("release workflow missing %q", want)
+			t.Fatalf(".goreleaser.yaml missing stable asset name %q", want)
 		}
+	}
+
+	// And the workflow must actually invoke GoReleaser.
+	wf, err := os.ReadFile(".github/workflows/release.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(wf), "goreleaser/goreleaser-action") {
+		t.Fatal("release workflow no longer runs goreleaser-action")
 	}
 }
 

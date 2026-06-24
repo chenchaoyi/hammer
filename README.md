@@ -34,6 +34,23 @@ driven by humans **and AI agents** alike.
 
 ## Install
 
+### Homebrew (macOS)
+
+```shell
+brew install chenchaoyi/tap/hammer
+hammer -version
+```
+
+Or tap once and install by name:
+
+```shell
+brew tap chenchaoyi/tap
+brew install hammer
+```
+
+Upgrade with `brew upgrade hammer`. (Homebrew casks are macOS-only; on Linux use
+the install script below or `hammer update`.)
+
 ### Install script (recommended)
 
 Install the latest GitHub release as a `hammer` command:

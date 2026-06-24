@@ -1,109 +1,75 @@
 name: release
 
+# Cuts a GitHub Release on tag push: GoReleaser cross-compiles the binaries,
+# archives one tarball per OS/arch (zip on Windows), emits SHA256SUMS, attaches
+# install.sh, and regenerates the Homebrew cask in chenchaoyi/homebrew-tap.
+# The asset names are kept identical to past releases so the `curl | sh`
+# installer and the built-in `hammer update` keep working unchanged.
+#
+# Trigger:
+#   - push of a tag matching `v*`  → the real release (+ tap update)
+#   - manual workflow_dispatch     → a snapshot dry-run (artifacts only, no
+#                                     release, no tap push) for validation
+
 on:
   push:
     tags:
       - 'v*'
   workflow_dispatch:
-    inputs:
-      version:
-        description: 'Release tag to create (e.g. v1.1.0)'
-        required: true
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 permissions:
   contents: write
 
 jobs:
-  build:
+  goreleaser:
     name: Build and release binaries
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0 # GoReleaser needs full history for the changelog
 
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
           check-latest: true
 
-      - name: Resolve version
-        id: version
-        run: |
-          set -euo pipefail
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            VERSION="${{ inputs.version }}"
-          else
-            VERSION="${GITHUB_REF#refs/tags/}"
-          fi
-          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-          echo "Releasing ${VERSION}"
-
       - name: Run tests
         run: go test -race ./...
 
-      - name: Build cross-platform binaries
-        run: |
-          set -euo pipefail
-          VERSION="${{ steps.version.outputs.version }}"
-          mkdir -p dist
-
-          targets=(
-            linux/amd64
-            linux/arm64
-            darwin/amd64
-            darwin/arm64
-            windows/amd64
-          )
-          for target in "${targets[@]}"; do
-            GOOS="${target%/*}"
-            GOARCH="${target#*/}"
-            ext=""
-            [ "$GOOS" = "windows" ] && ext=".exe"
-            bin="hammer-${GOOS}-${GOARCH}${ext}"
-            echo "Building $bin"
-            GOOS="$GOOS" GOARCH="$GOARCH" CGO_ENABLED=0 go build \
-              -trimpath \
-              -ldflags="-s -w -X main.version=${VERSION}" \
-              -o "dist/${bin}" .
-          done
-
-      - name: Package archives and checksums
-        run: |
-          set -euo pipefail
-          cd dist
-          cp ../install.sh install.sh
-          chmod 0755 install.sh
-          for bin in hammer-*; do
-            case "$bin" in
-              *.exe)
-                base="${bin%.exe}"
-                mkdir -p package
-                cp "$bin" package/hammer.exe
-                (cd package && zip "../${base}.zip" hammer.exe)
-                rm -rf package
-                ;;
-              *.zip|*.tar.gz|SHA256SUMS)
-                continue
-                ;;
-              *)
-                mkdir -p package
-                cp "$bin" package/hammer
-                tar -czf "${bin}.tar.gz" -C package hammer
-                rm -rf package
-                ;;
-            esac
-          done
-          rm -f hammer-*-amd64 hammer-*-arm64 hammer-*.exe
-          sha256sum *.tar.gz *.zip install.sh > SHA256SUMS
-          ls -lh
-
-      - name: Create release
-        uses: softprops/action-gh-release@v3
+      - name: GoReleaser (release on tag)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: goreleaser/goreleaser-action@v7
         with:
-          tag_name: ${{ steps.version.outputs.version }}
-          files: |
+          version: '~> v2'
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Pushes the regenerated cask to chenchaoyi/homebrew-tap. The default
+          # GITHUB_TOKEN can't write to another repo, so this must be a PAT
+          # (classic, `repo` scope) stored as the HOMEBREW_TAP_TOKEN secret.
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+
+      - name: GoReleaser (snapshot dry-run on dispatch)
+        if: github.event_name == 'workflow_dispatch'
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          version: '~> v2'
+          args: release --snapshot --clean --skip=publish
+        env:
+          HOMEBREW_TAP_TOKEN: ""
+
+      - name: Upload snapshot artifacts (dispatch only)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v6
+        with:
+          name: hammer-snapshot
+          path: |
             dist/*.tar.gz
             dist/*.zip
-            dist/install.sh
             dist/SHA256SUMS
-          generate_release_notes: true
-          fail_on_unmatched_files: true
+          retention-days: 14

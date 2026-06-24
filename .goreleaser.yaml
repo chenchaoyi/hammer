@@ -1,0 +1,113 @@
+# GoReleaser config for hammer.
+#
+# Produces the SAME release assets the previous hand-rolled workflow did, so the
+# `curl | sh` installer (install.sh) and the built-in `hammer update` keep
+# working unchanged:
+#
+#   hammer-<os>-<arch>.tar.gz   (linux/darwin)
+#   hammer-<os>-<arch>.zip      (windows)
+#   SHA256SUMS                  (sha256sum format: "<hash>  <name>")
+#   install.sh                  (attached to the release)
+#
+# On a version tag push, .github/workflows/release.yml runs `goreleaser release`,
+# which also regenerates the Homebrew formula in chenchaoyi/homebrew-tap.
+version: 2
+
+project_name: hammer
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: hammer
+    main: .
+    binary: hammer
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ignore:
+      # The previous workflow shipped windows/amd64 only.
+      - goos: windows
+        goarch: arm64
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X main.version={{ .Version }}
+
+archives:
+  - id: hammer
+    # hammer-<os>-<arch>.tar.gz — install.sh and `hammer update` build this
+    # exact name (no version segment), so keep it stable.
+    name_template: "hammer-{{ .Os }}-{{ .Arch }}"
+    formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    files:
+      - LICENSE
+      - README.md
+
+checksum:
+  # install.sh fetches SHA256SUMS and verifies the archive against it; the
+  # updater does the same. Keep the filename and sha256 algorithm stable.
+  name_template: "SHA256SUMS"
+  algorithm: sha256
+  extra_files:
+    # Keep install.sh's own checksum in SHA256SUMS, matching prior releases.
+    - glob: ./install.sh
+
+release:
+  github:
+    owner: chenchaoyi
+    name: hammer
+  draft: false
+  prerelease: auto
+  # Attach the installer so `curl .../install.sh | sh` keeps resolving.
+  extra_files:
+    - glob: ./install.sh
+
+changelog:
+  use: github
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+      - "^ci:"
+
+# Homebrew distribution. GoReleaser deprecated `brews` (formulae) in favor of
+# `homebrew_casks`; casks are macOS-only, so macOS users get `brew install
+# hammer` while Linux users keep the curl installer above (no regression).
+homebrew_casks:
+  - name: hammer
+    binaries:
+      - hammer
+    repository:
+      owner: chenchaoyi
+      name: homebrew-tap
+      branch: main
+      # Cross-repo push needs a PAT; the default GITHUB_TOKEN can't write to
+      # another repo. Set HOMEBREW_TAP_TOKEN in this repo's Actions secrets.
+      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
+    directory: Casks
+    homepage: "https://github.com/chenchaoyi/hammer"
+    description: "Lightweight, agent-friendly HTTP(S) load generator"
+    commit_author:
+      name: chenchaoyi
+      email: ccy.chenchaoyi@gmail.com
+    # The release binaries are unsigned; strip the quarantine bit so the CLI
+    # runs without a Gatekeeper prompt after `brew install`.
+    hooks:
+      post:
+        install: |
+          if OS.mac?
+            system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/hammer"]
+          end
