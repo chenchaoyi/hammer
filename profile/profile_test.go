@@ -230,6 +230,87 @@ func TestLoadFromReader_parsesStream(t *testing.T) {
 	}
 }
 
+func TestLoadFromReader_parsesArray(t *testing.T) {
+	src := strings.NewReader(`[
+		{"Weight": 1, "Method": "get",  "URL": "http://example.com/a", "Body": ""},
+		{"Weight": 3, "Method": "post", "URL": "http://example.com/b", "Body": "x", "Type": "rest"}
+	]`)
+	prof, err := LoadFromReader(src)
+	if err != nil {
+		t.Fatalf("LoadFromReader(array): %v", err)
+	}
+	if got, want := len(prof.calls), 2; got != want {
+		t.Fatalf("calls=%d, want %d", got, want)
+	}
+	if prof.calls[0].Method != "GET" {
+		t.Errorf("Method not upper-cased: %q", prof.calls[0].Method)
+	}
+	if prof.calls[1].Type != "REST" {
+		t.Errorf("Type not upper-cased: %q", prof.calls[1].Type)
+	}
+	if prof.totalWeight != 4 {
+		t.Errorf("totalWeight=%v, want 4", prof.totalWeight)
+	}
+	if prof.calls[0].randomWeight != 1 || prof.calls[1].randomWeight != 4 {
+		t.Errorf("cumulative weights = %v, %v; want 1, 4",
+			prof.calls[0].randomWeight, prof.calls[1].randomWeight)
+	}
+}
+
+// A single-element array is a common shape too (e.g. a generated profile that
+// happens to have one call); it must not be confused with the stream form.
+func TestLoadFromReader_singleElementArray(t *testing.T) {
+	prof, err := LoadFromReader(strings.NewReader(`[{"Weight":2,"Method":"GET","URL":"http://x/"}]`))
+	if err != nil {
+		t.Fatalf("LoadFromReader: %v", err)
+	}
+	if len(prof.calls) != 1 || prof.calls[0].URL != "http://x/" {
+		t.Fatalf("unexpected calls: %+v", prof.calls)
+	}
+}
+
+// Go's encoding/json matches field names case-insensitively, so the lowercase
+// keys an agent is likely to emit must load just like the documented form.
+func TestLoadFromReader_lowercaseKeys(t *testing.T) {
+	prof, err := LoadFromReader(strings.NewReader(
+		`[{"weight":1,"method":"get","url":"http://x/","body":"b","type":"rest"}]`))
+	if err != nil {
+		t.Fatalf("LoadFromReader: %v", err)
+	}
+	c := prof.calls[0]
+	if c.Method != "GET" || c.URL != "http://x/" || c.Body != "b" || c.Type != "REST" {
+		t.Errorf("lowercase keys not parsed: %+v", c)
+	}
+}
+
+func TestLoadFromReader_emptyArray(t *testing.T) {
+	_, err := LoadFromReader(strings.NewReader(`[]`))
+	if err == nil || !strings.Contains(err.Error(), "no calls") {
+		t.Fatalf("expected 'no calls' error for empty array, got %v", err)
+	}
+}
+
+func TestLoadFromReader_malformedArray(t *testing.T) {
+	if _, err := LoadFromReader(strings.NewReader(`[{"Weight":1,"URL":"http://x/"`)); err == nil {
+		t.Fatal("expected error on truncated array")
+	}
+}
+
+// Array and stream forms must be interchangeable through the file loader too.
+func TestLoadFromFile_parsesArray(t *testing.T) {
+	p := writeTempProfile(t, `[
+		{"Weight": 1, "Method": "GET", "URL": "http://example.com/a"},
+		{"Weight": 1, "Method": "GET", "URL": "http://example.com/b"}
+	]`)
+	prof, err := LoadFromFile(p)
+	if err != nil {
+		t.Fatalf("LoadFromFile(array): %v", err)
+	}
+	if len(prof.calls) != 2 {
+		t.Fatalf("calls=%d, want 2", len(prof.calls))
+	}
+}
+
 func TestLoadFromReader_empty(t *testing.T) {
 	_, err := LoadFromReader(strings.NewReader(""))
 	if err == nil || !strings.Contains(err.Error(), "no calls") {

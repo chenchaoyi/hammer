@@ -107,23 +107,62 @@ func LoadFromFile(path string) (*Profile, error) {
 	return p, nil
 }
 
-// LoadFromReader parses a traffic profile from any reader containing a stream
-// of JSON-encoded Call objects. It lets callers feed a profile from stdin or
-// any other source without first materializing a file.
+// LoadFromReader parses a traffic profile from any reader. It accepts either
+// form interchangeably:
+//
+//   - a JSON array of Call objects:  [ {…}, {…} ]   (the natural shape most
+//     callers and agents reach for first), or
+//   - a bare stream of Call objects: {…} {…}        (concatenated, whitespace
+//     between them optional).
+//
+// This lets callers feed a profile from stdin or any other source without
+// first materializing a file.
 func LoadFromReader(r io.Reader) (*Profile, error) {
+	data, err := io.ReadAll(r)
+	if err != nil {
+		return nil, err
+	}
+	if len(bytes.TrimSpace(data)) == 0 {
+		return nil, fmt.Errorf("no calls found")
+	}
+
 	p := &Profile{}
-	dec := json.NewDecoder(r)
-	for {
-		c := &Call{}
-		if err := dec.Decode(c); err == io.EOF {
-			break
-		} else if err != nil {
-			return nil, err
+	dec := json.NewDecoder(bytes.NewReader(data))
+
+	// Peek the first JSON token to tell an array apart from an object stream
+	// without consuming a whole value.
+	tok, err := dec.Token()
+	if err != nil {
+		return nil, err
+	}
+	if d, ok := tok.(json.Delim); ok && d == '[' {
+		// JSON array form: decode each element until the closing ']'.
+		for dec.More() {
+			c := &Call{}
+			if err := dec.Decode(c); err != nil {
+				return nil, err
+			}
+			if err := p.add(c); err != nil {
+				return nil, err
+			}
 		}
-		if err := p.add(c); err != nil {
-			return nil, err
+	} else {
+		// Object-stream form. The peeked token was the opening '{' of the
+		// first object, so re-decode from the start rather than mid-object.
+		dec = json.NewDecoder(bytes.NewReader(data))
+		for {
+			c := &Call{}
+			if err := dec.Decode(c); err == io.EOF {
+				break
+			} else if err != nil {
+				return nil, err
+			}
+			if err := p.add(c); err != nil {
+				return nil, err
+			}
 		}
 	}
+
 	if len(p.calls) == 0 {
 		return nil, fmt.Errorf("no calls found")
 	}
