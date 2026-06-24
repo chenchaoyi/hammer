@@ -133,6 +133,22 @@ running binary. It honors the same mirror controls as the installer — pass
 and `HAMMER_REPO` to update from a fork. If the binary lives in a directory you
 can't write to (e.g. `/usr/local/bin`), re-run with `sudo`.
 
+### Self-test
+
+Verify a freshly installed binary works end-to-end with no external target:
+
+```shell
+hammer selftest          # human-readable PASS/FAIL list
+hammer selftest -json    # machine-readable results for CI/agents
+```
+
+`selftest` spins up an in-process HTTP server and drives the **real** load
+engine against it, asserting request accounting, status-code classification,
+the `-ok` override, SLO threshold evaluation, header/Content-Type propagation,
+and profile parsing all behave. It exits `0` when every check passes and `1`
+otherwise — a quick smoke test for an agent to confirm the tool is healthy
+before relying on it.
+
 ## Quick start
 
 Zero-config — hammer a single URL for 10 seconds at 50 rps (no profile file needed):
