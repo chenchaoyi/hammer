@@ -748,6 +748,7 @@ Usage:
   hammer -profile FILE [options]            # weighted traffic mix from a file
   hammer -profile - [options]               # read the profile from stdin
   hammer update [options]                    # self-update to the latest release
+  hammer selftest [-json]                    # smoke-test this binary (no target needed)
 
 Agent-friendly options:
   -output json    emit the structured report to stdout (logs stay on stderr)
@@ -770,8 +771,13 @@ Options:
 }
 
 func main() {
-	if len(os.Args) > 1 && os.Args[1] == "update" {
-		os.Exit(runUpdate(os.Args[2:]))
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "update":
+			os.Exit(runUpdate(os.Args[2:]))
+		case "selftest":
+			os.Exit(runSelftest(os.Args[2:]))
+		}
 	}
 	os.Exit(run())
 }
